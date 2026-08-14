@@ -7,22 +7,21 @@ signed JPEG. See the Notion pages under The Human Internet → Technical
 Architecture and Docs for the full request flow and the AWS setup
 checklist this project fulfills.
 
-**Not yet built or deployed against a real KMS key** — this is a
-from-scratch scaffold written without a local Rust toolchain to compile
-against, so treat it as a first draft, not verified working code. Before
-trusting it:
+**Deployed and verified end-to-end against a real KMS key** as of
+2026-08-13 — see `CLAUDE.md`'s Status section for the verification
+details (`c2patool` against a real signed image, `validation_state: Valid`).
+If you're changing the signature path, still worth re-confirming:
 
-- `cargo build` / `cargo clippy` locally — nothing here has been compiled.
+- `cargo build` / `cargo clippy` locally after any change to
+  `kms_signer.rs` or `manifest.rs`.
 - The DER→raw ECDSA signature conversion in `src/kms_signer.rs` is the
   step most likely to be subtly wrong — it has no compile-time signal if
   the format is off, only a manifest that fails validation. Sign a test
   image, then read the manifest back with a real verifier (or
-  `PhotoSigner.readManifestJSON` in the iOS app against the same bytes)
-  before considering this done.
-- Whether a Function URL correctly delivers a raw `application/octet-stream`
-  POST body as base64/binary to `lambda_http` is worth confirming with a
-  direct `curl --data-binary` test against the deployed URL, independent of
-  the Supabase Edge Function.
+  `PhotoSigner.readManifestJSON` in the iOS app against the same bytes).
+- A direct `curl --data-binary` test against the deployed Function URL
+  confirms it delivers a raw `application/octet-stream` POST body
+  correctly to `lambda_http`, independent of the Supabase Edge Function.
 
 ## Building
 

@@ -1,0 +1,8 @@
+# Rust (aws-signing-lambda/)
+target/
+
+# Supabase CLI — local link cache, machine-specific
+supabase/.temp/
+
+# macOS
+.DS_Store
