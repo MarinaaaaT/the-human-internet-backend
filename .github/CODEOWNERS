@@ -1,0 +1,8 @@
+# Marina owns every path in this repo.
+#
+# On its own this file only auto-requests review — it enforces nothing.
+# It becomes blocking once "Require review from Code Owners" is enabled in
+# branch protection, which is worth doing when there's a second reviewer:
+# GitHub forbids approving your own PR, so a solo owner plus that setting
+# blocks every merge except by admin bypass.
+* @MarinaaaaT
