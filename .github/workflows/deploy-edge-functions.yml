@@ -1,0 +1,113 @@
+# Type-checks the three Supabase Edge Functions on every PR, and deploys
+# them on merge to main.
+#
+# The AWS signing Lambda is deliberately NOT deployed here — it needs an
+# arm64 builder, ~8GB of memory, and a c2patool verification pass that has
+# no fixture yet, and it fronts the live signing path. It stays manual;
+# see aws-signing-lambda/README.md.
+#
+# This job ships code only. Every function secret (STRIPE_SECRET_KEY,
+# AWS_SECRET_ACCESS_KEY, SUPABASE_SERVICE_ROLE_KEY, ...) already lives in
+# the Supabase project and is never passed through CI.
+
+name: Edge Functions
+
+on:
+  pull_request:
+    paths:
+      - "supabase/**"
+      - ".github/workflows/deploy-edge-functions.yml"
+  push:
+    branches: [main]
+    # Lambda-only changes shouldn't redeploy the functions.
+    paths:
+      - "supabase/**"
+      - ".github/workflows/deploy-edge-functions.yml"
+  workflow_dispatch:
+
+# Never let two deploys race; queue instead of cancelling, so a superseded
+# run still finishes rather than leaving a half-applied deploy.
+concurrency:
+  group: edge-functions-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # Runs on PRs and on main. Catches the typo/type-error class of failure
+  # before it reaches production, which is the only pre-merge signal there
+  # is right now — there's no staging project.
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Pinned rather than floating. Ideally this tracks whatever Deno
+      # version Supabase's edge runtime is on; it currently just matches
+      # the version these functions were verified against locally.
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.9.5
+
+      # Resolves the npm: specifiers (supabase-js, stripe) and type-checks
+      # our own code against them. Verified passing against all three
+      # functions as of this commit.
+      - name: Type-check
+        run: deno check supabase/functions/*/index.ts
+
+      - name: Lint
+        run: deno lint supabase/functions/
+
+      # NOTE: `deno fmt --check` is deliberately absent. All three files
+      # fail it today — purely on line wrapping, since deno fmt defaults to
+      # 80 columns and these are written at ~90. Adding it would mean
+      # reflowing three heavily-commented files for no correctness gain.
+      # If you ever want it, set lineWidth in a deno.json first.
+
+  deploy:
+    # Don't ship code that doesn't type-check.
+    needs: check
+    # PRs run `check` only; deploying happens on main and manual dispatch.
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    # Lets you attach required reviewers in repo settings later. Harmless
+    # if the environment doesn't exist yet — it's created unprotected.
+    environment: production
+    env:
+      SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+      # Not a secret; it's already in CLAUDE.md and in every client bundle.
+      PROJECT_REF: xpjkgngifffzdaikjakw
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Pinned rather than floating: the CLI is the deploy mechanism, and a
+      # silent minor bump is not something you want to discover via Stripe.
+      - uses: supabase/setup-cli@v1
+        with:
+          version: 2.114.0
+
+      # Deploys all three as a unit, matching how CLAUDE.md describes them.
+      # --use-api bundles server-side, so the runner needs no Docker.
+      # Do NOT add --prune: it deletes functions present in the project but
+      # absent from this repo, and it can't tell "removed" from "not here".
+      - name: Deploy functions
+        run: supabase functions deploy --project-ref "$PROJECT_REF" --use-api
+
+      # Guards the one deploy-time footgun: config.toml carries
+      # verify_jwt = false for the webhook. If that setting fails to apply,
+      # the platform rejects Stripe with 401 before the function ever runs
+      # and identity verifications silently stop landing.
+      #
+      # An unsigned POST is expected to reach the function and be turned
+      # away by its own signature check (400). A 401 means the JWT gate is
+      # back in front of it. Read-only: nothing is written on this path.
+      - name: Verify the webhook is still publicly reachable
+        run: |
+          status=$(curl -sS -o /dev/null -w '%{http_code}' \
+            -X POST "https://$PROJECT_REF.supabase.co/functions/v1/stripe-identity-webhook" \
+            -H 'Content-Type: application/json' \
+            -d '{}')
+          case "$status" in
+            400) echo "OK: reached the function, rejected by its signature check." ;;
+            401) echo "::error::verify_jwt regressed — Stripe deliveries will 401. Check supabase/config.toml." ; exit 1 ;;
+            *)   echo "::error::Unexpected status $status from the webhook endpoint." ; exit 1 ;;
+          esac
