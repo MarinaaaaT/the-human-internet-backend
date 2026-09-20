@@ -2,14 +2,14 @@
 // Stripe is the caller, not an app user). Verifies the Stripe-Signature
 // header, then flips `public.users.verification_status` on the two
 // VerificationSession outcome events — and, on `verified`, stores the name
-// Stripe actually checked against the document.
+// Stripe actually checked against the document, plus when it did so.
 //
 // That name is the only one the public verification page may ever show. The
 // page renders it beside "taken by a real, verified human", so a name the
 // user typed themselves would be a claim wearing our checkmark. This is the
-// one code path entitled to write it: `users.verified_first_name` /
-// `verified_last_name` are guarded by the same trigger pair as `is_admin`,
-// which exempts nothing but `service_role`.
+// one code path entitled to write them: `users.verified_first_name`,
+// `verified_last_name` and `identity_verified_at` are guarded by the same
+// trigger pair as `is_admin`, which exempts nothing but `service_role`.
 //
 // Uses the Supabase service-role key (unlike stripe-identity-session) since
 // there's no caller JWT to scope RLS to — this is the same elevated-write
@@ -174,6 +174,12 @@ Deno.serve(async (req) => {
       const patch: Record<string, string> = { verification_status: verificationStatus };
 
       if (verificationStatus === "verified") {
+        // The event's own timestamp, not `now()`: it is when Stripe actually
+        // verified, it survives a redelivery without drifting, and the
+        // verification pages quote it as fact ("Identity Last Verified by
+        // Stripe on {date}").
+        patch.identity_verified_at = new Date(event.created * 1000).toISOString();
+
         const name = await fetchVerifiedName(session.id, mode);
         if (name) {
           patch.verified_first_name = name.first;
