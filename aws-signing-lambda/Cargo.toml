@@ -16,6 +16,13 @@ p256 = "0.13"
 sha2 = "0.10"
 base64 = "0.22"
 anyhow = "1"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+
+[dev-dependencies]
+# Test-only: mints a throwaway CA + leaf at test time so the manifest tests
+# can sign without a KMS key and without committing any private key.
+rcgen = "0.13"
+serde_json = "1"
 
 [profile.release]
 strip = true

@@ -32,12 +32,50 @@ non-technical process — see the app repo's `CLAUDE.md` Known Gap #1).
   returns ASN.1 DER-encoded ECDSA signatures; COSE ES256 needs fixed-width
   raw `r||s`. `p256::ecdsa::Signature::from_der(...).to_bytes()` does the
   conversion — confirmed correct against a real signature (see Status).
-- `src/manifest.rs` — the manifest JSON, hand-written rather than built
-  from typed assertion structs, because c2pa-rs's v2 actions assertion
-  wants camelCase `digitalSourceType` and the typed builders don't reliably
-  produce that (same issue `PhotoSigner.swift` hit; keep the two manifest
-  shapes in sync, there's no shared source between the Swift and Rust
-  signers).
+- **Two routes** (`Route` in `src/main.rs`): `POST /capture` signs the body
+  as-is as a `digitalCapture` — step one of the capture pipeline, and all a
+  build predating server-side watermarking needs; `POST /watermark` takes a
+  capture *already signed by `/capture`*, burns the brand mark in and signs
+  the result with that signed capture as its `parentOf` ingredient
+  (`c2pa.opened` → `c2pa.edited`). `sign-photo` calls them in sequence; see
+  the repo root `CLAUDE.md`. Any other path 404s.
+  - **`POST /` is a temporary alias for `/capture`.** The `sign-photo`
+    deployed before routing existed POSTs to the Function URL's root, and
+    this Lambda may be deployed first. Remove the alias (`Route::for_path`)
+    once the `sign-photo` that calls `/capture` is live — nothing else calls
+    this Lambda.
+  - **Every success names the route that ran** in `x-signing-route`.
+    `sign-photo` refuses a `/watermark` response without
+    `x-signing-route: watermark`: the Lambda before routing ignored the path
+    and signed everything as a capture, which for `/watermark` would have
+    returned an *unwatermarked* photo for the app to publish.
+- `src/manifest.rs` — both manifests, hand-written JSON rather than typed
+  assertion structs, because c2pa-rs's v2 actions assertion wants camelCase
+  `digitalSourceType` and the typed builders don't reliably produce that.
+  `/watermark` refuses input with no C2PA manifest, so the ingredient is
+  always a signed capture.
+- `src/watermark.rs` — composites the brand mark, **an image:
+  `assets/brand-mark.png`** (embedded with `include_bytes!`), onto the
+  decoded capture: width 9% of the shorter side, height from the PNG's own
+  aspect ratio, inset 3.5%, top-trailing; resampled with alpha
+  premultiplied (no dark fringe), and converted sRGB → Display P3 when the
+  capture is tagged P3, which iPhone captures are. **EXIF orientation is
+  applied first** — an iPhone stores portraits sideways and tagged — and the
+  ICC profile is kept; other metadata is dropped. **The same PNG is the
+  app's `BrandMarkWatermark` image set**, drawn by `PhotoWatermarker` and
+  the processing overlay `ProvisionalWatermark`; to change the artwork,
+  replace it in both repos (sRGB, transparent background, ≥ ~600px wide) and
+  update the dimension check in each repo's tests. The current file is a
+  render of the old vector `BrandMark`, standing in until real artwork.
+- **Tests** (`cargo test --release`): the watermark's placement and
+  orientation handling, and both manifests read back through `c2pa::Reader`
+  — `Valid`, with `signingCredential.untrusted` the only failure, the
+  capture's `digitalCapture` claim surviving inside the ingredient. They sign
+  with a throwaway CA minted per run by `rcgen`; no key is committed.
+- **Sizing.** `/watermark` decodes, draws and re-encodes a full-resolution
+  JPEG. At the current 768MB / 10s, check a real 12MP capture's duration in
+  CloudWatch after deploying; raising to ~1536MB (Lambda CPU scales with
+  memory) and a 30s timeout is the likely fix if it's tight.
 
 ## Building
 
@@ -100,13 +138,15 @@ comment.
 ## Testing without going through the Function URL
 
 `aws lambda invoke` can hit the function directly with a Function-URL-shaped
-event payload, bypassing SigV4 entirely for a quick smoke test:
+event payload, bypassing SigV4 entirely for a quick smoke test. For
+`/watermark`, set both paths to `/watermark` and send the *output* of a
+`/capture` call — a raw JPEG is refused as not a signed capture:
 
 ```json
 {
   "version": "2.0",
-  "rawPath": "/",
-  "requestContext": { "http": { "method": "POST", "path": "/" } },
+  "rawPath": "/capture",
+  "requestContext": { "http": { "method": "POST", "path": "/capture" } },
   "body": "<base64-encoded JPEG>",
   "isBase64Encoded": true
 }
