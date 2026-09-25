@@ -13,6 +13,7 @@ FROM rust:1-bookworm AS builder
 WORKDIR /build
 COPY Cargo.toml Cargo.lock* ./
 COPY src ./src
+COPY assets ./assets
 RUN cargo build --release
 
 FROM public.ecr.aws/lambda/provided:al2023
