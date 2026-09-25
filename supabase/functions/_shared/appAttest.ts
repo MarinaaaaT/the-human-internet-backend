@@ -18,6 +18,8 @@
 
 import { decode as decodeCbor } from "npm:cbor-x@1";
 import * as x509 from "npm:@peculiar/x509@1";
+import { p256, p384 } from "npm:@noble/curves@1.9.7/nist";
+import { sha256 as nobleSha256, sha384 as nobleSha384 } from "npm:@noble/hashes@1.8.0/sha2";
 
 /// Apple App Attestation Root CA — pinned, never fetched. SHA-256 fingerprint
 /// 1C:B9:82:3B:A2:8B:A6:AD:2D:33:A0:06:94:1D:E2:AE:4F:51:3E:F1:D4:E8:31:B9:F7:E0:FA:7B:62:42:C9:32,
@@ -114,9 +116,9 @@ export async function verifyAttestation(params: {
   const intermediate = new x509.X509Certificate(buf(asBytes(x5c[1], "x5c[1]")));
   const root = new x509.X509Certificate(params.rootCertPem ?? APPLE_APP_ATTEST_ROOT_CA_PEM);
   const chainOK =
-    (await credCert.verify({ publicKey: intermediate.publicKey, date: now })) &&
-    (await intermediate.verify({ publicKey: root.publicKey, date: now })) &&
-    (await root.verify({ date: now }));
+    isIssuedBy(credCert, intermediate, now) &&
+    isIssuedBy(intermediate, root, now) &&
+    isIssuedBy(root, root, now);
   if (!chainOK) {
     throw new AppAttestError("certificate chain does not verify to Apple's App Attest root");
   }
@@ -198,25 +200,25 @@ export async function verifyAssertion(params: {
   //      (ECDSA P-256 / SHA-256, DER-encoded) by the attested key.
   const clientDataHash = await sha256(params.clientData);
   const nonce = await sha256(concat(authenticatorData, clientDataHash));
-  const key = await crypto.subtle.importKey(
-    "spki",
-    buf(params.publicKeySpki),
-    { name: "ECDSA", namedCurve: "P-256" },
-    false,
-    ["verify"],
-  );
-  let rawSignature: Uint8Array;
+  //      Pure JS rather than WebCrypto, for the same runtime reason as
+  //      `isIssuedBy`: one implementation, identical locally and deployed.
+  let key;
   try {
-    rawSignature = derToRawEcdsaSignature(signature, 32);
+    key = issuerKey(params.publicKeySpki);
+  } catch {
+    key = null;
+  }
+  if (!key || key.curve !== p256) throw new AppAttestError("registered key is not a P-256 key");
+  let valid: boolean;
+  try {
+    valid = key.curve.verify(signature, nobleSha256(nonce), key.point, {
+      prehash: false,
+      lowS: false,
+      format: "der",
+    });
   } catch {
     throw new AppAttestError("assertion signature is malformed");
   }
-  const valid = await crypto.subtle.verify(
-    { name: "ECDSA", hash: "SHA-256" },
-    key,
-    buf(rawSignature),
-    buf(nonce),
-  );
   if (!valid) throw new AppAttestError("assertion signature is invalid");
 
   // 4. Our app id.
@@ -229,6 +231,93 @@ export async function verifyAssertion(params: {
   if (parsed.signCount < 1) throw new AppAttestError("assertion counter is not positive");
 
   return { signCount: parsed.signCount };
+}
+
+// ---- certificate chain -----------------------------------------------------
+
+/// Whether `cert` is in date at `now` and carries a valid signature by
+/// `issuer`'s key.
+///
+/// Deliberately **not** WebCrypto (`X509Certificate.verify` uses it):
+/// Supabase's Edge runtime throws `NotSupportedError: Not implemented` for
+/// ECDSA over a P-384 key with a SHA-256 hash — exactly how Apple's App
+/// Attest CA signs every credential certificate — though a local Deno
+/// supports it, so tests passed while every real registration 500'd. The
+/// check runs in pure JS (noble-curves) instead, which behaves the same
+/// everywhere. Only ECDSA with P-256/P-384 and SHA-256/SHA-384 is
+/// accepted; that covers Apple's whole chain, and anything else fails
+/// closed.
+function isIssuedBy(cert: x509.X509Certificate, issuer: x509.X509Certificate, now: Date): boolean {
+  if (now < cert.notBefore || now > cert.notAfter) return false;
+  try {
+    const der = new Uint8Array(cert.rawData);
+    const outer = readTlv(der, 0);
+    const tbs = readTlv(der, outer.valueStart);
+    const algorithm = readTlv(der, tbs.end);
+    const signature = readTlv(der, algorithm.end);
+    if (outer.tag !== 0x30 || tbs.tag !== 0x30 || algorithm.tag !== 0x30 || signature.tag !== 0x03) {
+      return false;
+    }
+    const algorithmOid = readTlv(der, algorithm.valueStart);
+    const oid = der.slice(algorithmOid.start, algorithmOid.end);
+    const hash = equal(oid, OID_ECDSA_WITH_SHA256)
+      ? nobleSha256
+      : equal(oid, OID_ECDSA_WITH_SHA384)
+      ? nobleSha384
+      : null;
+    if (!hash) return false;
+    // BIT STRING: a leading unused-bits byte (0), then the DER ECDSA-Sig-Value.
+    if (der[signature.valueStart] !== 0) return false;
+    const derSignature = der.slice(signature.valueStart + 1, signature.end);
+
+    const key = issuerKey(new Uint8Array(issuer.publicKey.rawData));
+    if (!key) return false;
+    const digest = hash(der.slice(tbs.start, tbs.end));
+    return key.curve.verify(derSignature, digest, key.point, {
+      prehash: false,
+      lowS: false,
+      format: "der",
+    });
+  } catch {
+    return false;
+  }
+}
+
+const OID_ECDSA_WITH_SHA256 = new Uint8Array([0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x02]);
+const OID_ECDSA_WITH_SHA384 = new Uint8Array([0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x03]);
+const OID_P256 = new Uint8Array([0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07]);
+const OID_P384 = new Uint8Array([0x06, 0x05, 0x2b, 0x81, 0x04, 0x00, 0x22]);
+
+/// The curve and uncompressed point of an EC SubjectPublicKeyInfo:
+/// `SEQUENCE { SEQUENCE { ecPublicKey, namedCurve }, BIT STRING point }`.
+function issuerKey(spki: Uint8Array) {
+  const outer = readTlv(spki, 0);
+  const algorithm = readTlv(spki, outer.valueStart);
+  const keyType = readTlv(spki, algorithm.valueStart);
+  const curveOid = readTlv(spki, keyType.end);
+  const bits = readTlv(spki, algorithm.end);
+  const oid = spki.slice(curveOid.start, curveOid.end);
+  const curve = equal(oid, OID_P256) ? p256 : equal(oid, OID_P384) ? p384 : null;
+  if (!curve || bits.tag !== 0x03 || spki[bits.valueStart] !== 0) return null;
+  return { curve, point: spki.slice(bits.valueStart + 1, bits.end) };
+}
+
+/// One DER TLV at `offset`: its tag, where its value starts, and where the
+/// whole element (`start`..`end`, header included) lies.
+function readTlv(der: Uint8Array, offset: number) {
+  const tag = der[offset];
+  let length = der[offset + 1];
+  let valueStart = offset + 2;
+  if (length & 0x80) {
+    const bytes = length & 0x7f;
+    if (bytes === 0 || bytes > 4) throw new Error("unsupported DER length");
+    length = 0;
+    for (let i = 0; i < bytes; i++) length = length * 256 + der[valueStart + i];
+    valueStart += bytes;
+  }
+  const end = valueStart + length;
+  if (tag === undefined || end > der.length) throw new Error("truncated DER");
+  return { tag, start: offset, valueStart, end };
 }
 
 // ---- helpers ---------------------------------------------------------------
@@ -251,32 +340,6 @@ function nonceFromExtension(value: Uint8Array): Uint8Array {
     throw new AppAttestError("nonce extension has an unexpected shape");
   }
   return value.slice(prefix.length);
-}
-
-/// WebCrypto verifies ECDSA signatures in IEEE P1363 form (r ‖ s, fixed
-/// width); App Attest hands out ASN.1 DER `SEQUENCE { INTEGER r, INTEGER s }`.
-export function derToRawEcdsaSignature(der: Uint8Array, size: number): Uint8Array {
-  let offset = 0;
-  if (der[offset++] !== 0x30) throw new Error("not a SEQUENCE");
-  let seqLength = der[offset++];
-  if (seqLength & 0x80) {
-    const bytes = seqLength & 0x7f;
-    seqLength = 0;
-    for (let i = 0; i < bytes; i++) seqLength = (seqLength << 8) | der[offset++];
-  }
-  if (offset + seqLength !== der.length) throw new Error("bad SEQUENCE length");
-  const out = new Uint8Array(size * 2);
-  for (let part = 0; part < 2; part++) {
-    if (der[offset++] !== 0x02) throw new Error("not an INTEGER");
-    const length = der[offset++];
-    let integer = der.slice(offset, offset + length);
-    offset += length;
-    while (integer.length > size && integer[0] === 0) integer = integer.slice(1);
-    if (integer.length > size) throw new Error("INTEGER too long");
-    out.set(integer, part * size + (size - integer.length));
-  }
-  if (offset !== der.length) throw new Error("trailing bytes");
-  return out;
 }
 
 /// A standalone ArrayBuffer copy of `bytes`, for APIs (WebCrypto, X.509)
