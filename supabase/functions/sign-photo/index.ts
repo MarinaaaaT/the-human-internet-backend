@@ -22,6 +22,15 @@
 // Errors carry a `code` the app acts on: `attestation_key_unknown` and
 // `attestation_invalid` make it discard its key and register a fresh one.
 //
+// **Capture pipeline** (`X-Capture-Pipeline: server-watermark-v1` +
+// `X-Photo-Id`): the body is the *raw* capture. It's signed as a capture,
+// the Lambda burns the brand mark into that signed capture and signs the
+// result with it as the parent ingredient, the signed capture is stored in
+// the private `photo-originals` bucket, and the watermarked photo is returned
+// for the app to upload. Without the header the body is signed as-is — the
+// legacy path every build predating this still uses, sending bytes it
+// watermarked itself.
+//
 // Required secrets (`supabase secrets set`): SIGNING_LAMBDA_URL,
 // AWS_REGION, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY. Until those are
 // set this function 500s.
@@ -40,6 +49,19 @@ const AWS_REGION = Deno.env.get("AWS_REGION")!;
 /// default, since failing closed on a flag we couldn't read would stop every
 /// upload from every build that predates attestation.
 const REQUIRE_APP_ATTEST_FLAG = "require_app_attest";
+
+/// Opts a request into the capture pipeline, and is echoed on the response
+/// so the app can tell a backend that did the watermarking from one that
+/// predates it (and would have signed the raw capture as-is — which the app
+/// must never upload as the shared photo).
+const PIPELINE_HEADER = "X-Capture-Pipeline";
+const CAPTURE_PIPELINE = "server-watermark-v1";
+
+/// Private bucket holding each signed capture — the ingredient of the photo
+/// that's shared. Owner-readable, written only here with the service role.
+const ORIGINALS_BUCKET = "photo-originals";
+
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
 const supabaseAdmin = createClient(
   Deno.env.get("SUPABASE_URL")!,
@@ -75,7 +97,8 @@ Deno.serve(async (req) => {
       });
     }
 
-    const imageData = new Uint8Array(await req.arrayBuffer());
+    const body = await req.arrayBuffer();
+    const imageData = new Uint8Array(body);
     if (imageData.length === 0) {
       return new Response(JSON.stringify({ error: "Missing image data" }), {
         status: 400,
@@ -86,43 +109,22 @@ Deno.serve(async (req) => {
     const refusal = await checkAppAttest(req, imageData, user.id, supabaseClient);
     if (refusal) return refusal;
 
-    const url = new URL(LAMBDA_FUNCTION_URL);
-    const signableRequest = new HttpRequest({
-      method: "POST",
-      protocol: url.protocol,
-      hostname: url.hostname,
-      path: url.pathname,
-      headers: {
-        host: url.hostname,
-        "content-type": "application/octet-stream",
-      },
-      body: imageData,
-    });
-
-    const signedRequest = await signer.sign(signableRequest);
-
-    const lambdaResponse = await fetch(url, {
-      method: signedRequest.method,
-      headers: signedRequest.headers,
-      body: imageData,
-    });
-
-    if (!lambdaResponse.ok) {
-      console.error(
-        "Signing Lambda returned",
-        lambdaResponse.status,
-        await lambdaResponse.text(),
-      );
-      return new Response(JSON.stringify({ error: "Signing failed" }), {
-        status: 502,
-        headers: { "Content-Type": "application/json" },
-      });
+    const photoID = req.headers.get("X-Photo-Id")?.toLowerCase();
+    if (req.headers.get(PIPELINE_HEADER) === CAPTURE_PIPELINE) {
+      if (!photoID || !UUID_PATTERN.test(photoID)) {
+        return new Response(JSON.stringify({ error: "X-Photo-Id must be the photo's UUID" }), {
+          status: 400,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      return await signCapturePipeline(body, user.id, photoID);
     }
 
-    const signedImageData = await lambdaResponse.arrayBuffer();
-    return new Response(signedImageData, {
-      headers: { "Content-Type": "image/jpeg" },
-    });
+    // Legacy: sign the body as-is. What every build predating server-side
+    // watermarking sends — already-watermarked bytes.
+    const signed = await invokeLambda("", body);
+    if (!signed) return signingFailed();
+    return new Response(signed, { headers: { "Content-Type": "image/jpeg" } });
   } catch (error) {
     console.error(error);
     return new Response(JSON.stringify({ error: "Couldn't sign photo" }), {
@@ -131,6 +133,85 @@ Deno.serve(async (req) => {
     });
   }
 });
+
+/// The capture pipeline: the body is the raw capture.
+///   1. sign it as-is — `c2pa.created` / `digitalCapture`;
+///   2. have the Lambda burn the brand mark into *that signed capture* and
+///      sign the result with it as the parent ingredient;
+///   3. keep the signed capture in the originals bucket, for photo history;
+///   4. hand back the watermarked photo, which the app uploads as the photo.
+/// The App Attest assertion (checked before this) is over the raw capture,
+/// so the chain starts at bytes the app itself captured.
+async function signCapturePipeline(
+  rawCapture: ArrayBuffer,
+  userID: string,
+  photoID: string,
+): Promise<Response> {
+  const signedCapture = await invokeLambda("", rawCapture);
+  if (!signedCapture) return signingFailed();
+
+  const watermarked = await invokeLambda("watermark", signedCapture);
+  if (!watermarked) return signingFailed();
+
+  // Same `{user_id}/{photo_id}.jpg` shape as the photos bucket. Upsert, so
+  // a retry after a later step failed just overwrites the same object.
+  const { error: storeError } = await supabaseAdmin.storage
+    .from(ORIGINALS_BUCKET)
+    .upload(`${userID}/${photoID}.jpg`, signedCapture, {
+      contentType: "image/jpeg",
+      upsert: true,
+    });
+  if (storeError) throw storeError;
+
+  return new Response(watermarked, {
+    headers: { "Content-Type": "image/jpeg", [PIPELINE_HEADER]: CAPTURE_PIPELINE },
+  });
+}
+
+/// POSTs `body` to the signing Lambda at `route` ("" = sign as a capture,
+/// "watermark" = watermark a signed capture and sign the result), SigV4-signed.
+/// Null on a Lambda error, which is logged.
+async function invokeLambda(route: string, body: ArrayBuffer): Promise<ArrayBuffer | null> {
+  const base = new URL(LAMBDA_FUNCTION_URL);
+  const url = new URL(base.pathname.replace(/\/*$/, "/") + route, base);
+  const signedRequest = await signer.sign(
+    new HttpRequest({
+      method: "POST",
+      protocol: url.protocol,
+      hostname: url.hostname,
+      path: url.pathname,
+      headers: {
+        host: url.hostname,
+        "content-type": "application/octet-stream",
+      },
+      body,
+    }),
+  );
+
+  const lambdaResponse = await fetch(url, {
+    method: signedRequest.method,
+    headers: signedRequest.headers,
+    body,
+  });
+  if (!lambdaResponse.ok) {
+    console.error(
+      "Signing Lambda returned",
+      lambdaResponse.status,
+      "for route",
+      route || "/",
+      await lambdaResponse.text(),
+    );
+    return null;
+  }
+  return await lambdaResponse.arrayBuffer();
+}
+
+function signingFailed(): Response {
+  return new Response(JSON.stringify({ error: "Signing failed" }), {
+    status: 502,
+    headers: { "Content-Type": "application/json" },
+  });
+}
 
 /// Returns a response to send instead of signing, or null to go ahead.
 async function checkAppAttest(

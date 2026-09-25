@@ -32,12 +32,34 @@ non-technical process — see the app repo's `CLAUDE.md` Known Gap #1).
   returns ASN.1 DER-encoded ECDSA signatures; COSE ES256 needs fixed-width
   raw `r||s`. `p256::ecdsa::Signature::from_der(...).to_bytes()` does the
   conversion — confirmed correct against a real signature (see Status).
-- `src/manifest.rs` — the manifest JSON, hand-written rather than built
-  from typed assertion structs, because c2pa-rs's v2 actions assertion
-  wants camelCase `digitalSourceType` and the typed builders don't reliably
-  produce that (same issue `PhotoSigner.swift` hit; keep the two manifest
-  shapes in sync, there's no shared source between the Swift and Rust
-  signers).
+- **Two routes** (`src/main.rs`): `POST /` signs the body as-is as a
+  `digitalCapture` — the original route, and step one of the capture
+  pipeline; `POST /watermark` takes a capture *already signed by `/`*,
+  burns the brand mark in and signs the result with that signed capture as
+  its `parentOf` ingredient (`c2pa.opened` → `c2pa.edited`). `sign-photo`
+  calls them in sequence; see the repo root `CLAUDE.md`. Any other path 404s.
+- `src/manifest.rs` — both manifests, hand-written JSON rather than typed
+  assertion structs, because c2pa-rs's v2 actions assertion wants camelCase
+  `digitalSourceType` and the typed builders don't reliably produce that.
+  `/watermark` refuses input with no C2PA manifest, so the ingredient is
+  always a signed capture.
+- `src/watermark.rs` — the brand mark, drawn with `tiny-skia` onto the
+  decoded capture: 9% of the shorter side, inset 3.5%, top-trailing, in
+  `Theme.accentPink` (converted to Display P3 when the capture is tagged
+  P3, which iPhone captures are). **EXIF orientation is applied first** —
+  an iPhone stores portraits sideways and tagged — and the ICC profile is
+  kept; other metadata is dropped. The geometry is a contract with the
+  app's `PhotoWatermarker` and `ProvisionalWatermark`, pinned on that side
+  by `CapturePipelineTests`.
+- **Tests** (`cargo test --release`): the watermark's placement and
+  orientation handling, and both manifests read back through `c2pa::Reader`
+  — `Valid`, with `signingCredential.untrusted` the only failure, the
+  capture's `digitalCapture` claim surviving inside the ingredient. They sign
+  with a throwaway CA minted per run by `rcgen`; no key is committed.
+- **Sizing.** `/watermark` decodes, draws and re-encodes a full-resolution
+  JPEG. At the current 768MB / 10s, check a real 12MP capture's duration in
+  CloudWatch after deploying; raising to ~1536MB (Lambda CPU scales with
+  memory) and a 30s timeout is the likely fix if it's tight.
 
 ## Building
 

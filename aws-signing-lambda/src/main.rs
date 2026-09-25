@@ -1,5 +1,6 @@
 mod kms_signer;
 mod manifest;
+mod watermark;
 
 use aws_sdk_kms::Client as KmsClient;
 use aws_sdk_ssm::Client as SsmClient;
@@ -12,11 +13,22 @@ use lambda_http::{run, service_fn, Body, Error, Request, Response};
 /// something that depends on this image.
 const CERT_CHAIN_PARAM: &str = "/c2pa/cert-chain";
 
-/// The one Lambda in this project: receives a raw captured JPEG (from the
-/// `sign-photo` Supabase Edge Function, over a SigV4-authenticated Function
-/// URL — see supabase/functions/sign-photo/index.ts) and returns it
-/// C2PA-signed, using a KMS-held key that never leaves AWS. See
-/// aws-signing-lambda/README.md for provisioning.
+/// The one Lambda in this project: signs JPEGs for the `sign-photo` Supabase
+/// Edge Function, over a SigV4-authenticated Function URL (see
+/// supabase/functions/sign-photo/index.ts), using a KMS-held key that never
+/// leaves AWS. See aws-signing-lambda/README.md for provisioning.
+///
+/// Two routes:
+/// - `POST /` — sign the body as-is as a `digitalCapture`. The original
+///   route, still what builds predating server-side watermarking use, and
+///   step one of the capture pipeline.
+/// - `POST /watermark` — step two: the body must be a capture already
+///   signed by `/`; returns it with the brand mark burned in, signed with the
+///   capture as its parent ingredient.
+///
+/// Two calls rather than one returning both images: a Function URL response
+/// is capped at 6MB (base64-encoded), which one full-resolution JPEG
+/// already comes close to.
 #[tokio::main]
 async fn main() -> Result<(), Error> {
     tracing_subscriber::fmt().json().init();
@@ -65,12 +77,29 @@ async fn handle(
             .body(Body::Text("Missing image data".into()))?);
     }
 
+    enum Route {
+        Capture,
+        Watermark,
+    }
+    let route = match req.uri().path().trim_end_matches('/') {
+        "" => Route::Capture,
+        "/watermark" => Route::Watermark,
+        other => {
+            return Ok(Response::builder()
+                .status(404)
+                .body(Body::Text(format!("No route {other}")))?);
+        }
+    };
+
     // c2pa-rs's Builder is synchronous, and KmsSigner blocks its own
     // thread waiting on KMS — both wrong to run directly on an async task,
     // so this whole call is pushed onto Tokio's blocking thread pool.
-    let signed = tokio::task::spawn_blocking(move || {
+    let signed = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<u8>> {
         let signer = KmsSigner::new(kms_client, key_id, &cert_chain_pem)?;
-        manifest::sign_jpeg(&image_data, &signer).map_err(anyhow::Error::from)
+        match route {
+            Route::Capture => Ok(manifest::sign_capture(&image_data, &signer)?),
+            Route::Watermark => manifest::sign_watermarked(&image_data, &signer),
+        }
     })
     .await??;
 
