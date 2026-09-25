@@ -5,13 +5,12 @@
 // certificate chain; the assertion cases add locally generated P-256 keys so
 // that tampering can be tested in each direction.
 
-import { assert, assertEquals, assertRejects } from "jsr:@std/assert@1";
+import { assertEquals, assertRejects } from "jsr:@std/assert@1";
 import { decode as decodeCbor, encode as encodeCbor } from "npm:cbor-x@1";
 import * as x509 from "npm:@peculiar/x509@1";
 import {
   AppAttestError,
   concat,
-  derToRawEcdsaSignature,
   fromBase64,
   sha256,
   toBase64,
@@ -20,6 +19,15 @@ import {
 } from "./appAttest.ts";
 
 const FIXTURE_APP_ID = "V8H6LQ9448.io.uebelacker.AppAttestExample";
+
+/// A real assertion from Apple's service for the same sample app (also from
+/// `node-app-attest`'s tests), with the key and clientData it was made over.
+const REAL_ASSERTION =
+  "omlzaWduYXR1cmVYRzBFAiBB8BGAwkmFCg1M5J0mOYEun0SUN1/lse79/7ypG9WiMQIhAIHvqj7eg59B1PMFX1CN4GMGlsgfFtdL30pHCf7G/dNRcWF1dGhlbnRpY2F0b3JEYXRhWCXKPdw7T3iujcFZbHVrHX0mDSMrNms5PzEbrFbQPRA6rEAAAAAB";
+const REAL_ASSERTION_KEY =
+  "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEg69t2YzgcPTLUx8Zgu+rbcikeaEL8Ppb+HG0QTIulz8YUB9tgv1pDRruWk87nZC3our56pzIWaqXEbaWyamdzA==";
+const REAL_ASSERTION_CLIENT_DATA =
+  '{"subject":"Lorem ipsum","message":"Lorem ipsum dolor sit amet, consectetur adipiscing elit."}';
 
 async function loadFixture(name: "development" | "production") {
   const json = JSON.parse(
@@ -55,6 +63,38 @@ for (const environment of ["development", "production"] as const) {
     assertEquals(toBase64(await sha256(result.publicKeySpki.slice(-65))), f.keyId);
   });
 }
+
+/// Supabase's Edge runtime throws `NotSupportedError: Not implemented` from
+/// `crypto.subtle.verify` for ECDSA P-384 + SHA-256 — how Apple signs every
+/// credential certificate — though a local Deno doesn't, which is how the
+/// first version passed here and failed every real registration. Stand in
+/// for that runtime: chain verification must not touch WebCrypto verify.
+Deno.test("attestation verifies without WebCrypto signature verification", async () => {
+  const f = await loadFixture("production");
+  const original = crypto.subtle.verify;
+  crypto.subtle.verify = () => Promise.reject(new DOMException("Not implemented", "NotSupportedError"));
+  try {
+    const result = await verifyAttestation({
+      attestation: f.attestation,
+      challenge: f.challenge,
+      keyId: f.keyId,
+      appId: FIXTURE_APP_ID,
+      now: f.now,
+    });
+    assertEquals(result.environment, "production");
+
+    // And the per-photo check sign-photo runs on every request.
+    const { signCount } = await verifyAssertion({
+      assertion: fromBase64(REAL_ASSERTION),
+      clientData: new TextEncoder().encode(REAL_ASSERTION_CLIENT_DATA),
+      publicKeySpki: fromBase64(REAL_ASSERTION_KEY),
+      appId: FIXTURE_APP_ID,
+    });
+    assertEquals(signCount, 1);
+  } finally {
+    crypto.subtle.verify = original;
+  }
+});
 
 Deno.test("attestation for another app is rejected", async () => {
   const f = await loadFixture("production");
@@ -182,15 +222,9 @@ Deno.test("attestation that isn't CBOR is rejected", async () => {
 // ---- assertions -------------------------------------------------------------
 
 Deno.test("real assertion from Apple's service verifies", async () => {
-  const assertion = fromBase64(
-    "omlzaWduYXR1cmVYRzBFAiBB8BGAwkmFCg1M5J0mOYEun0SUN1/lse79/7ypG9WiMQIhAIHvqj7eg59B1PMFX1CN4GMGlsgfFtdL30pHCf7G/dNRcWF1dGhlbnRpY2F0b3JEYXRhWCXKPdw7T3iujcFZbHVrHX0mDSMrNms5PzEbrFbQPRA6rEAAAAAB",
-  );
-  const publicKeySpki = fromBase64(
-    "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEg69t2YzgcPTLUx8Zgu+rbcikeaEL8Ppb+HG0QTIulz8YUB9tgv1pDRruWk87nZC3our56pzIWaqXEbaWyamdzA==",
-  );
-  const clientData = new TextEncoder().encode(
-    '{"subject":"Lorem ipsum","message":"Lorem ipsum dolor sit amet, consectetur adipiscing elit."}',
-  );
+  const assertion = fromBase64(REAL_ASSERTION);
+  const publicKeySpki = fromBase64(REAL_ASSERTION_KEY);
+  const clientData = new TextEncoder().encode(REAL_ASSERTION_CLIENT_DATA);
   const { signCount } = await verifyAssertion({
     assertion,
     clientData,
@@ -327,13 +361,4 @@ Deno.test("garbage assertion is rejected as an AppAttestError", async () => {
       }),
     AppAttestError,
   );
-});
-
-Deno.test("DER → raw signature handles padded and short integers", () => {
-  const r = new Uint8Array(32).fill(0x80); // high bit set ⇒ DER pads with 00
-  const s = concat(new Uint8Array(2), new Uint8Array(30).fill(0x11)); // leading zeros ⇒ DER shortens
-  const raw = derToRawEcdsaSignature(rawToDer(concat(r, s)), 32);
-  assert(raw.length === 64);
-  assertEquals(raw.slice(0, 32), r);
-  assertEquals(raw.slice(32), s);
 });
