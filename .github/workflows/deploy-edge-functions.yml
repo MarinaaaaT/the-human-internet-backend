@@ -1,4 +1,4 @@
-# Type-checks the three Supabase Edge Functions on every PR, and deploys
+# Type-checks every Supabase Edge Function on every PR, and deploys
 # them on merge to main.
 #
 # The AWS signing Lambda is deliberately NOT deployed here — it needs an
@@ -48,8 +48,8 @@ jobs:
           deno-version: v2.9.5
 
       # Resolves the npm: specifiers (supabase-js, stripe) and type-checks
-      # our own code against them. Verified passing against all three
-      # functions as of this commit.
+      # our own code against them. Verified passing against all
+      # functions as of this commit (plus _shared/, via lint).
       - name: Type-check
         run: deno check supabase/functions/*/index.ts
 
@@ -85,7 +85,7 @@ jobs:
         with:
           version: 2.114.0
 
-      # Deploys all three as a unit, matching how CLAUDE.md describes them.
+      # Deploys every function as a unit, matching how CLAUDE.md describes them.
       # --use-api bundles server-side, so the runner needs no Docker.
       # Do NOT add --prune: it deletes functions present in the project but
       # absent from this repo, and it can't tell "removed" from "not here".
