@@ -18,13 +18,18 @@ const CERT_CHAIN_PARAM: &str = "/c2pa/cert-chain";
 /// supabase/functions/sign-photo/index.ts), using a KMS-held key that never
 /// leaves AWS. See aws-signing-lambda/README.md for provisioning.
 ///
-/// Two routes:
-/// - `POST /` — sign the body as-is as a `digitalCapture`. The original
-///   route, still what builds predating server-side watermarking use, and
-///   step one of the capture pipeline.
+/// Two routes (see `Route`):
+/// - `POST /capture` — sign the body as-is as a `digitalCapture`. Step one
+///   of the capture pipeline, and all a request from a build predating
+///   server-side watermarking ever needs.
 /// - `POST /watermark` — step two: the body must be a capture already
-///   signed by `/`; returns it with the brand mark burned in, signed with the
-///   capture as its parent ingredient.
+///   signed by `/capture`; returns it with the brand mark burned in, signed
+///   with the capture as its parent ingredient.
+///
+/// Every success names the route that actually ran in `x-signing-route`, so
+/// `sign-photo` can refuse a `/watermark` answered by a Lambda that predates
+/// routing (it ignored the path and signed everything as a capture — which
+/// for `/watermark` would hand back an unwatermarked photo).
 ///
 /// Two calls rather than one returning both images: a Function URL response
 /// is capped at 6MB (base64-encoded), which one full-resolution JPEG
@@ -77,18 +82,10 @@ async fn handle(
             .body(Body::Text("Missing image data".into()))?);
     }
 
-    enum Route {
-        Capture,
-        Watermark,
-    }
-    let route = match req.uri().path().trim_end_matches('/') {
-        "" => Route::Capture,
-        "/watermark" => Route::Watermark,
-        other => {
-            return Ok(Response::builder()
-                .status(404)
-                .body(Body::Text(format!("No route {other}")))?);
-        }
+    let Some(route) = Route::for_path(req.uri().path()) else {
+        return Ok(Response::builder()
+            .status(404)
+            .body(Body::Text(format!("No route {}", req.uri().path())))?);
     };
 
     // c2pa-rs's Builder is synchronous, and KmsSigner blocks its own
@@ -106,5 +103,59 @@ async fn handle(
     Ok(Response::builder()
         .status(200)
         .header("content-type", "image/jpeg")
+        .header(ROUTE_HEADER, route.name())
         .body(Body::Binary(signed))?)
+}
+
+/// Response header naming the route that ran. Mirrored in `sign-photo`.
+const ROUTE_HEADER: &str = "x-signing-route";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Route {
+    Capture,
+    Watermark,
+}
+
+impl Route {
+    fn for_path(path: &str) -> Option<Route> {
+        match path.trim_end_matches('/') {
+            "/capture" => Some(Route::Capture),
+            // Temporary alias: the `sign-photo` deployed before routing
+            // existed POSTs to the Function URL's root, and this Lambda can
+            // be deployed before the `sign-photo` that calls `/capture`.
+            // Remove once that `sign-photo` is live — nothing else calls it.
+            "" => Some(Route::Capture),
+            "/watermark" => Some(Route::Watermark),
+            _ => None,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Route::Capture => "capture",
+            Route::Watermark => "watermark",
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Route;
+
+    #[test]
+    fn routes_resolve_by_path() {
+        assert_eq!(Route::for_path("/capture"), Some(Route::Capture));
+        assert_eq!(Route::for_path("/capture/"), Some(Route::Capture));
+        assert_eq!(Route::for_path("/watermark"), Some(Route::Watermark));
+        assert_eq!(Route::for_path("/"), Some(Route::Capture), "legacy root alias");
+        assert_eq!(Route::for_path(""), Some(Route::Capture), "legacy root alias");
+        assert_eq!(Route::for_path("/sign"), None);
+        assert_eq!(Route::for_path("/watermark/extra"), None);
+    }
+
+    #[test]
+    fn route_header_names_what_ran() {
+        assert_eq!(Route::Capture.name(), "capture");
+        assert_eq!(Route::Watermark.name(), "watermark");
+    }
 }

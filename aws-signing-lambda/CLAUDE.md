@@ -32,12 +32,23 @@ non-technical process — see the app repo's `CLAUDE.md` Known Gap #1).
   returns ASN.1 DER-encoded ECDSA signatures; COSE ES256 needs fixed-width
   raw `r||s`. `p256::ecdsa::Signature::from_der(...).to_bytes()` does the
   conversion — confirmed correct against a real signature (see Status).
-- **Two routes** (`src/main.rs`): `POST /` signs the body as-is as a
-  `digitalCapture` — the original route, and step one of the capture
-  pipeline; `POST /watermark` takes a capture *already signed by `/`*,
-  burns the brand mark in and signs the result with that signed capture as
-  its `parentOf` ingredient (`c2pa.opened` → `c2pa.edited`). `sign-photo`
-  calls them in sequence; see the repo root `CLAUDE.md`. Any other path 404s.
+- **Two routes** (`Route` in `src/main.rs`): `POST /capture` signs the body
+  as-is as a `digitalCapture` — step one of the capture pipeline, and all a
+  build predating server-side watermarking needs; `POST /watermark` takes a
+  capture *already signed by `/capture`*, burns the brand mark in and signs
+  the result with that signed capture as its `parentOf` ingredient
+  (`c2pa.opened` → `c2pa.edited`). `sign-photo` calls them in sequence; see
+  the repo root `CLAUDE.md`. Any other path 404s.
+  - **`POST /` is a temporary alias for `/capture`.** The `sign-photo`
+    deployed before routing existed POSTs to the Function URL's root, and
+    this Lambda may be deployed first. Remove the alias (`Route::for_path`)
+    once the `sign-photo` that calls `/capture` is live — nothing else calls
+    this Lambda.
+  - **Every success names the route that ran** in `x-signing-route`.
+    `sign-photo` refuses a `/watermark` response without
+    `x-signing-route: watermark`: the Lambda before routing ignored the path
+    and signed everything as a capture, which for `/watermark` would have
+    returned an *unwatermarked* photo for the app to publish.
 - `src/manifest.rs` — both manifests, hand-written JSON rather than typed
   assertion structs, because c2pa-rs's v2 actions assertion wants camelCase
   `digitalSourceType` and the typed builders don't reliably produce that.
@@ -127,13 +138,15 @@ comment.
 ## Testing without going through the Function URL
 
 `aws lambda invoke` can hit the function directly with a Function-URL-shaped
-event payload, bypassing SigV4 entirely for a quick smoke test:
+event payload, bypassing SigV4 entirely for a quick smoke test. For
+`/watermark`, set both paths to `/watermark` and send the *output* of a
+`/capture` call — a raw JPEG is refused as not a signed capture:
 
 ```json
 {
   "version": "2.0",
-  "rawPath": "/",
-  "requestContext": { "http": { "method": "POST", "path": "/" } },
+  "rawPath": "/capture",
+  "requestContext": { "http": { "method": "POST", "path": "/capture" } },
   "body": "<base64-encoded JPEG>",
   "isBase64Encoded": true
 }

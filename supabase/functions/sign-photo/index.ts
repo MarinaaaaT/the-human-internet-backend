@@ -25,7 +25,8 @@
 // **Capture pipeline** (`X-Capture-Pipeline: server-watermark-v1` +
 // `X-Photo-Id`): the body is the *raw* capture. It's signed as a capture,
 // the Lambda burns the brand mark into that signed capture and signs the
-// result with it as the parent ingredient, the signed capture is stored in
+// result with it as the parent ingredient (`/capture` then `/watermark`),
+// the signed capture is stored in
 // the private `photo-originals` bucket, and the watermarked photo is returned
 // for the app to upload. Without the header the body is signed as-is — the
 // legacy path every build predating this still uses, sending bytes it
@@ -122,7 +123,7 @@ Deno.serve(async (req) => {
 
     // Legacy: sign the body as-is. What every build predating server-side
     // watermarking sends — already-watermarked bytes.
-    const signed = await invokeLambda("", body);
+    const signed = await invokeLambda("capture", body);
     if (!signed) return signingFailed();
     return new Response(signed, { headers: { "Content-Type": "image/jpeg" } });
   } catch (error) {
@@ -147,10 +148,15 @@ async function signCapturePipeline(
   userID: string,
   photoID: string,
 ): Promise<Response> {
-  const signedCapture = await invokeLambda("", rawCapture);
+  const signedCapture = await invokeLambda("capture", rawCapture);
   if (!signedCapture) return signingFailed();
 
-  const watermarked = await invokeLambda("watermark", signedCapture);
+  // `requireRouteConfirmation`: a Lambda that predates routing ignores the
+  // path and would sign this as another capture — no watermark — and the app
+  // would upload it. Only a Lambda that says it ran `watermark` is believed.
+  const watermarked = await invokeLambda("watermark", signedCapture, {
+    requireRouteConfirmation: true,
+  });
   if (!watermarked) return signingFailed();
 
   // Same `{user_id}/{photo_id}.jpg` shape as the photos bucket. Upsert, so
@@ -168,10 +174,20 @@ async function signCapturePipeline(
   });
 }
 
-/// POSTs `body` to the signing Lambda at `route` ("" = sign as a capture,
-/// "watermark" = watermark a signed capture and sign the result), SigV4-signed.
-/// Null on a Lambda error, which is logged.
-async function invokeLambda(route: string, body: ArrayBuffer): Promise<ArrayBuffer | null> {
+/// Response header in which the Lambda names the route it actually ran.
+/// Mirrored in aws-signing-lambda/src/main.rs.
+const LAMBDA_ROUTE_HEADER = "x-signing-route";
+
+/// POSTs `body` to the signing Lambda's `route` — "capture" (sign as-is as a
+/// capture) or "watermark" (watermark a signed capture and sign the result)
+/// — SigV4-signed. Null on a Lambda error, or, with
+/// `requireRouteConfirmation`, on a response that doesn't name `route` in
+/// `x-signing-route`; either is logged.
+async function invokeLambda(
+  route: "capture" | "watermark",
+  body: ArrayBuffer,
+  { requireRouteConfirmation = false } = {},
+): Promise<ArrayBuffer | null> {
   const base = new URL(LAMBDA_FUNCTION_URL);
   const url = new URL(base.pathname.replace(/\/*$/, "/") + route, base);
   const signedRequest = await signer.sign(
@@ -198,8 +214,16 @@ async function invokeLambda(route: string, body: ArrayBuffer): Promise<ArrayBuff
       "Signing Lambda returned",
       lambdaResponse.status,
       "for route",
-      route || "/",
+      route,
       await lambdaResponse.text(),
+    );
+    return null;
+  }
+  const ranRoute = lambdaResponse.headers.get(LAMBDA_ROUTE_HEADER);
+  if (requireRouteConfirmation && ranRoute !== route) {
+    console.error(
+      `Signing Lambda answered /${route} without confirming it ran it`,
+      `(${LAMBDA_ROUTE_HEADER}: ${ranRoute ?? "absent"}) — is the deployed Lambda older than its routes?`,
     );
     return null;
   }

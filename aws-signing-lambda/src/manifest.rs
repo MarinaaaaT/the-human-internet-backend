@@ -78,8 +78,8 @@ fn watermarked_manifest_json() -> String {
 }
 
 /// Signs a capture (a JPEG) as-is, as a `digitalCapture`, and returns the
-/// signed JPEG bytes. This is the Lambda's original and default route, and
-/// also step one of the capture pipeline.
+/// signed JPEG bytes. The `/capture` route: step one of the capture
+/// pipeline, and all a build predating server-side watermarking needs.
 ///
 /// Blocking — callers on an async runtime should run this via
 /// `spawn_blocking` (see main.rs), both because c2pa-rs's Builder is
@@ -94,8 +94,8 @@ pub fn sign_capture(image_data: &[u8], signer: &dyn Signer) -> C2paResult<Vec<u8
     Ok(dest.into_inner())
 }
 
-/// Step two of the capture pipeline: takes a capture *already signed* by
-/// `sign_capture`, burns the brand mark in, and signs the result with the
+/// Step two of the capture pipeline (`/watermark`): takes a capture
+/// *already signed* by `sign_capture`, burns the brand mark in, and signs the result with the
 /// signed capture as its parent ingredient. Returns the watermarked JPEG.
 ///
 /// Refuses input with no C2PA manifest, so the ingredient is always a signed
