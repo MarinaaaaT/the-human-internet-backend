@@ -6,3 +6,9 @@ verify_jwt = false
 
 [functions.sign-photo]
 verify_jwt = true
+
+[functions.app-attest-challenge]
+verify_jwt = true
+
+[functions.app-attest-register]
+verify_jwt = true
