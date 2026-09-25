@@ -5,21 +5,24 @@
 //! had already signed, rather than bytes a client says it watermarked — the
 //! second manifest then records an edit the signer actually performed.
 //!
-//! The geometry is a contract with two Swift copies that must look the same:
-//! `PhotoWatermarker` (still used on the legacy/Skip-C2PA paths) and
-//! `ProvisionalWatermark` (the overlay the app draws over a capture while it's
-//! still processing, so the swap to the real watermarked photo is invisible).
-//! Both lay out SwiftUI's `BrandMark`: a horizontal capsule over a narrower
-//! vertical one, `size` = 9% of the image's shorter side, inset 3.5% of it
-//! from the top-trailing corner.
+//! **The mark is an image: `assets/brand-mark.png`.** The same file ships in
+//! the app's asset catalog as `BrandMarkWatermark`, where `PhotoWatermarker`
+//! (legacy/Skip-C2PA paths) and `ProvisionalWatermark` (the overlay drawn
+//! over a capture still processing) draw it. To change the artwork, replace
+//! the PNG in both places — nothing else. Placement is the other half of the
+//! contract, and is stated relative to the image so any artwork fits: width
+//! 9% of the photo's shorter side, height from the PNG's own aspect ratio,
+//! inset 3.5% of the shorter side from the top-trailing corner. Artwork
+//! should be sRGB, transparent where it isn't mark, and at least ~600px wide
+//! (9% of a 48MP capture's shorter side is 544px).
 
 use anyhow::{Context, Result};
 use image::{
-    codecs::jpeg::JpegEncoder, DynamicImage, ExtendedColorType, ImageDecoder, ImageEncoder,
-    ImageReader, RgbImage,
+    codecs::jpeg::JpegEncoder, imageops, DynamicImage, ExtendedColorType, ImageDecoder,
+    ImageEncoder, ImageReader, Rgba32FImage, RgbImage,
 };
 use std::io::Cursor;
-use tiny_skia::{FillRule, Paint, PathBuilder, Pixmap, Transform};
+use std::sync::OnceLock;
 
 /// Mark width as a fraction of the image's shorter side.
 pub const MARK_SIZE_FRACTION: f32 = 0.09;
@@ -28,13 +31,8 @@ pub const MARK_PADDING_FRACTION: f32 = 0.035;
 /// Matches `UIImage.jpegData(compressionQuality: 0.95)` in `PhotoWatermarker`.
 const JPEG_QUALITY: u8 = 95;
 
-/// `Theme.accentPink` — SwiftUI `Color(red: 0.89, green: 0.66, blue: 0.87)`,
-/// which is sRGB.
-const PINK_SRGB: [u8; 3] = [227, 168, 222];
-/// The same colour expressed in Display P3, which is what an iPhone capture
-/// is tagged with. Painting the sRGB triple straight into P3 pixels would
-/// come out visibly more saturated than the app's own rendering of the mark.
-const PINK_DISPLAY_P3: [u8; 3] = [218, 171, 219];
+/// The artwork. Identical to the app's `BrandMarkWatermark` image set.
+const BRAND_MARK_PNG: &[u8] = include_bytes!("../assets/brand-mark.png");
 
 /// Returns `jpeg` with the brand mark burned in, re-encoded as a JPEG.
 ///
@@ -54,11 +52,13 @@ pub fn watermark_jpeg(jpeg: &[u8]) -> Result<Vec<u8>> {
     image.apply_orientation(orientation);
     let mut rgb = image.into_rgb8();
 
+    // An iPhone capture is tagged Display P3; the artwork is sRGB. Pasting
+    // sRGB values straight into P3 pixels would come out visibly more
+    // saturated than the app's own (colour-managed) rendering of the mark.
     let is_display_p3 = icc_profile
         .as_deref()
         .is_some_and(|icc| contains(icc, b"Display P3") || contains(icc, &utf16be("Display P3")));
-    let pink = if is_display_p3 { PINK_DISPLAY_P3 } else { PINK_SRGB };
-    draw_mark(&mut rgb, pink)?;
+    draw_mark(&mut rgb, is_display_p3)?;
 
     let mut out = Vec::new();
     let mut encoder = JpegEncoder::new_with_quality(&mut out, JPEG_QUALITY);
@@ -70,8 +70,9 @@ pub fn watermark_jpeg(jpeg: &[u8]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-/// Where the mark goes on a `width`×`height` image: its top-left corner and
-/// its `size` (width; it's 0.84×size tall), in pixels.
+/// Where the mark goes on a `width`×`height` photo: its top-left corner
+/// and its width, in pixels. Its height is the width times the artwork's
+/// aspect ratio.
 pub fn mark_placement(width: u32, height: u32) -> (f32, f32, f32) {
     let shorter = width.min(height) as f32;
     let size = shorter * MARK_SIZE_FRACTION;
@@ -79,73 +80,83 @@ pub fn mark_placement(width: u32, height: u32) -> (f32, f32, f32) {
     (width as f32 - size - padding, padding, size)
 }
 
-fn draw_mark(image: &mut RgbImage, pink: [u8; 3]) -> Result<()> {
-    let (x, y, size) = mark_placement(image.width(), image.height());
-
-    // Rasterise just the mark's bounding box, keeping the sub-pixel offset
-    // so anti-aliased edges fall where UIKit's would.
-    let left = x.floor();
-    let top = y.floor();
-    let right = (x + size).ceil().min(image.width() as f32);
-    let bottom = (y + size * 0.84).ceil().min(image.height() as f32);
-    let mut pixmap = Pixmap::new((right - left) as u32, (bottom - top) as u32)
-        .context("mark region is empty")?;
-
-    let mut paint = Paint::default();
-    paint.set_color_rgba8(pink[0], pink[1], pink[2], 255);
-    paint.anti_alias = true;
-    let transform = Transform::from_translate(x - left, y - top);
-
-    // SwiftUI `BrandMark`: VStack(spacing: 0) {
-    //   Capsule().frame(width: size, height: size * 0.22)
-    //   RoundedRectangle(cornerRadius: size * 0.3)
-    //     .frame(width: size * 0.5, height: size * 0.62).offset(y: -size * 0.04)
-    // }
-    // The rectangle's 0.3 radius is clamped to half its 0.5 width, so it is
-    // a vertical capsule too.
-    for (rx, ry, rw, rh) in [
-        (0.0, 0.0, size, size * 0.22),
-        (size * 0.25, size * 0.22 - size * 0.04, size * 0.5, size * 0.62),
-    ] {
-        let path = capsule(rx, ry, rw, rh).context("degenerate mark shape")?;
-        pixmap.fill_path(&path, &paint, FillRule::Winding, transform, None);
+/// The artwork, decoded once per Lambda instance, with its alpha
+/// premultiplied so resampling doesn't drag the (meaningless) colour of
+/// transparent pixels into the mark's edges as a dark fringe.
+fn brand_mark() -> Result<&'static Rgba32FImage> {
+    static MARK: OnceLock<Rgba32FImage> = OnceLock::new();
+    if let Some(mark) = MARK.get() {
+        return Ok(mark);
     }
+    let mut mark = image::load_from_memory(BRAND_MARK_PNG)
+        .context("brand-mark.png is not a decodable image")?
+        .into_rgba32f();
+    for px in mark.pixels_mut() {
+        let a = px.0[3];
+        for c in &mut px.0[..3] {
+            *c *= a;
+        }
+    }
+    Ok(MARK.get_or_init(|| mark))
+}
 
-    // Source-over, from tiny-skia's premultiplied RGBA onto opaque RGB.
-    let width = pixmap.width();
-    for (i, px) in pixmap.pixels().iter().enumerate() {
-        let alpha = px.alpha() as u32;
-        if alpha == 0 {
+/// The artwork's height / width.
+pub fn mark_aspect_ratio() -> Result<f32> {
+    let mark = brand_mark()?;
+    Ok(mark.height() as f32 / mark.width() as f32)
+}
+
+fn draw_mark(image: &mut RgbImage, to_display_p3: bool) -> Result<()> {
+    let (x, y, width) = mark_placement(image.width(), image.height());
+    let height = width * mark_aspect_ratio()?;
+    let scaled = imageops::resize(
+        brand_mark()?,
+        width.round().max(1.0) as u32,
+        height.round().max(1.0) as u32,
+        imageops::FilterType::Lanczos3,
+    );
+
+    let (left, top) = (x.round() as i64, y.round() as i64);
+    for (mx, my, px) in scaled.enumerate_pixels() {
+        let (dx, dy) = (left + mx as i64, top + my as i64);
+        if dx < 0 || dy < 0 || dx >= image.width() as i64 || dy >= image.height() as i64 {
             continue;
         }
-        let dx = left as u32 + i as u32 % width;
-        let dy = top as u32 + i as u32 / width;
-        let dst = image.get_pixel_mut(dx, dy);
-        let src = [px.red(), px.green(), px.blue()];
-        for (d, s) in dst.0.iter_mut().zip(src) {
-            *d = (s as u32 + (*d as u32 * (255 - alpha) + 127) / 255) as u8;
+        // Lanczos rings slightly past [0, 1]; clamp before un-premultiplying.
+        let alpha = px.0[3].clamp(0.0, 1.0);
+        if alpha <= 0.0 {
+            continue;
+        }
+        let mut color = [px.0[0], px.0[1], px.0[2]].map(|c| (c / alpha).clamp(0.0, 1.0));
+        if to_display_p3 {
+            color = srgb_to_display_p3(color);
+        }
+        let dst = image.get_pixel_mut(dx as u32, dy as u32);
+        for (d, s) in dst.0.iter_mut().zip(color) {
+            let blended = s * alpha + (*d as f32 / 255.0) * (1.0 - alpha);
+            *d = (blended * 255.0).round().clamp(0.0, 255.0) as u8;
         }
     }
     Ok(())
 }
 
-/// A rounded rectangle whose corner radius is half its shorter side.
-fn capsule(x: f32, y: f32, w: f32, h: f32) -> Option<tiny_skia::Path> {
-    let r = w.min(h) / 2.0;
-    // Cubic Bézier quarter-circle constant.
-    let k = r * 0.552_284_8;
-    let mut pb = PathBuilder::new();
-    pb.move_to(x + r, y);
-    pb.line_to(x + w - r, y);
-    pb.cubic_to(x + w - r + k, y, x + w, y + r - k, x + w, y + r);
-    pb.line_to(x + w, y + h - r);
-    pb.cubic_to(x + w, y + h - r + k, x + w - r + k, y + h, x + w - r, y + h);
-    pb.line_to(x + r, y + h);
-    pb.cubic_to(x + r - k, y + h, x, y + h - r + k, x, y + h - r);
-    pb.line_to(x, y + r);
-    pb.cubic_to(x, y + r - k, x + r - k, y, x + r, y);
-    pb.close();
-    pb.finish()
+/// Re-expresses a gamma-encoded sRGB colour in Display P3 (same primaries'
+/// white point and transfer curve, wider gamut), so it looks the same once
+/// the photo is shown through its P3 profile.
+pub fn srgb_to_display_p3(rgb: [f32; 3]) -> [f32; 3] {
+    fn decode(v: f32) -> f32 {
+        if v <= 0.04045 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
+    }
+    fn encode(v: f32) -> f32 {
+        let v = v.clamp(0.0, 1.0);
+        if v <= 0.003_130_8 { v * 12.92 } else { 1.055 * v.powf(1.0 / 2.4) - 0.055 }
+    }
+    let [r, g, b] = rgb.map(decode);
+    [
+        encode(0.822_462 * r + 0.177_538 * g),
+        encode(0.033_194 * r + 0.966_806 * g),
+        encode(0.017_083 * r + 0.072_397 * g + 0.910_520 * b),
+    ]
 }
 
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
@@ -174,6 +185,9 @@ mod tests {
     fn decode(jpeg: &[u8]) -> RgbImage {
         image::load_from_memory(jpeg).unwrap().into_rgb8()
     }
+
+    /// The stand-in artwork's colour — `Theme.accentPink`.
+    const PINK_SRGB: [u8; 3] = [227, 168, 222];
 
     fn is_pink(p: &Rgb<u8>) -> bool {
         p.0[0].abs_diff(PINK_SRGB[0]) < 12
@@ -219,6 +233,28 @@ mod tests {
         assert!(is_pink(out.get_pixel((x + size / 2.0) as u32, (y + size * 0.5) as u32)));
     }
 
+    /// `Theme.accentPink` in P3, as UIKit would convert it: (218, 171, 219).
+    #[test]
+    fn srgb_pink_converts_to_the_expected_display_p3_values() {
+        let p3 = srgb_to_display_p3(PINK_SRGB.map(|c| c as f32 / 255.0)).map(|c| (c * 255.0).round() as u8);
+        for (got, want) in p3.iter().zip([218u8, 171, 219]) {
+            assert!(got.abs_diff(want) <= 1, "{p3:?}");
+        }
+        // Greys are the same in both spaces.
+        let grey = srgb_to_display_p3([0.5, 0.5, 0.5]);
+        assert!(grey.iter().all(|c| (c - 0.5).abs() < 0.002), "{grey:?}");
+    }
+
+    /// Must be the same PNG as the app's `BrandMarkWatermark` image set —
+    /// the app's `CapturePipelineTests` pins the same dimensions. When the
+    /// artwork changes, replace it in both repos and update both tests.
+    #[test]
+    fn artwork_is_the_shared_png_and_large_enough_for_a_48mp_capture() {
+        let mark = brand_mark().unwrap();
+        assert_eq!(mark.dimensions(), (1024, 860));
+        assert!(mark.width() >= 544, "a 48MP capture's mark is 544px wide");
+    }
+
     #[test]
     fn non_images_are_rejected() {
         assert!(watermark_jpeg(b"definitely not a jpeg").is_err());
@@ -247,3 +283,4 @@ mod tests {
         out
     }
 }
+

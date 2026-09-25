@@ -43,14 +43,19 @@ non-technical process — see the app repo's `CLAUDE.md` Known Gap #1).
   `digitalSourceType` and the typed builders don't reliably produce that.
   `/watermark` refuses input with no C2PA manifest, so the ingredient is
   always a signed capture.
-- `src/watermark.rs` — the brand mark, drawn with `tiny-skia` onto the
-  decoded capture: 9% of the shorter side, inset 3.5%, top-trailing, in
-  `Theme.accentPink` (converted to Display P3 when the capture is tagged
-  P3, which iPhone captures are). **EXIF orientation is applied first** —
-  an iPhone stores portraits sideways and tagged — and the ICC profile is
-  kept; other metadata is dropped. The geometry is a contract with the
-  app's `PhotoWatermarker` and `ProvisionalWatermark`, pinned on that side
-  by `CapturePipelineTests`.
+- `src/watermark.rs` — composites the brand mark, **an image:
+  `assets/brand-mark.png`** (embedded with `include_bytes!`), onto the
+  decoded capture: width 9% of the shorter side, height from the PNG's own
+  aspect ratio, inset 3.5%, top-trailing; resampled with alpha
+  premultiplied (no dark fringe), and converted sRGB → Display P3 when the
+  capture is tagged P3, which iPhone captures are. **EXIF orientation is
+  applied first** — an iPhone stores portraits sideways and tagged — and the
+  ICC profile is kept; other metadata is dropped. **The same PNG is the
+  app's `BrandMarkWatermark` image set**, drawn by `PhotoWatermarker` and
+  the processing overlay `ProvisionalWatermark`; to change the artwork,
+  replace it in both repos (sRGB, transparent background, ≥ ~600px wide) and
+  update the dimension check in each repo's tests. The current file is a
+  render of the old vector `BrandMark`, standing in until real artwork.
 - **Tests** (`cargo test --release`): the watermark's placement and
   orientation handling, and both manifests read back through `c2pa::Reader`
   — `Valid`, with `signingCredential.untrusted` the only failure, the
