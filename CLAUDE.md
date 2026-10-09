@@ -30,7 +30,7 @@ Full architecture, build/deploy instructions, gotchas, and the AWS resource inve
 
 ## Supabase Edge Functions
 
-Deployed as a unit via the Supabase CLI (`supabase functions deploy`); `supabase/config.toml` covers all five.
+Deployed as a unit via the Supabase CLI (`supabase functions deploy`); `supabase/config.toml` covers all six.
 
 ### `sign-photo`
 Forwards a captured JPEG to the AWS Lambda's Function URL over SigV4 and returns the signed bytes — the only bridge between Supabase and AWS, and the app's only signer (`Verification/RemotePhotoSigner.swift`; the on-device fallback and the `aws_server_side_signing` flag that chose between them were removed from the app on 2026-09-23). Runs with the caller's forwarded JWT (`verify_jwt = true`), so it only ever signs on behalf of the authenticated user calling it. Requires secrets `SIGNING_LAMBDA_URL`, `AWS_REGION`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` — the AWS credentials are this function's own IAM user (`c2pa-signer-invoker`), SigV4-scoped to `lambda:InvokeFunctionUrl` on exactly this one Lambda, nothing else in the AWS account. Without those secrets the function 500s, which surfaces to users as a photo stuck in "still being verified" and then a failed-upload row in the app's pending banner (`PhotoUploadQueue` retries rather than losing it, so it recovers once the function is healthy again).
@@ -66,11 +66,16 @@ Still missing (tracked on Notion's Tech Debt board as **[T2]**): no `event.id` d
 
 **Stripe account**: `acct_1U3zoI2H64CKCopg` ("Human Internet LLC. sandbox"). The Identity Dashboard application was completed on 2026-08-29, clearing the long-standing blocker (Delaware LLC processing → business bank account). What remains before either environment works end-to-end is configuration, not code: the four Stripe secrets above set via `supabase secrets set`, and the webhook endpoint registered — separately in live and in sandbox — for `identity.verification_session.verified` and `.requires_input`. Onboarding stays behind the app's `stripe_identity_verification` flag (currently `off`) until that's done. There's no in-app resubmission flow yet for a `failed` status, and `in_progress` is a dead end for the same reason — both tracked in Notion (Product Backlog).
 
+### `delete-account`
+Permanently deletes the **calling** user's account — the app's Settings → Account Settings → Delete Account. `verify_jwt = true`; the caller is identified from their own JWT and the request body is never read, so there's no way to name another user. Then, under the service role: `photos` rows first (what `get_verification_photo()` reads, so every shared link dies immediately — same order as the app's `PhotoRepository.delete`), then every object under `{user_id}/` in `photos` and `photo-originals`, then `auth.admin.deleteUser`, which cascades to `public.users`. Identity goes **last** so any failure leaves an account the user can sign back into and retry; each step is idempotent. Requires `SUPABASE_SERVICE_ROLE_KEY` (auto-provided). **Not done yet:** revoking the Sign in with Apple token (Apple's `/auth/revoke`, App Store guideline 5.1.1(v)) — needs the Services ID's `.p8` key as a secret to mint the client secret; Supabase doesn't do it on `deleteUser`.
+
 ## Database
 
 Schema, RLS policies, and triggers live in the shared Supabase project itself (`xpjkgngifffzdaikjakw`) — **not tracked as migration files in any repo**; changes are applied directly (dashboard or the Supabase MCP tools) and documented in the app repo's `CLAUDE.md` Database section, which remains the source of truth for table shapes, RLS, and the `is_admin` escalation guards. If that ever changes to a tracked-migrations workflow, this repo is the natural home for `supabase/migrations/`.
 
 **`photo-originals` bucket + `photos.original_storage_path`** (`supabase/sql/2026-09-25_server_watermark.sql`): each signed capture — the ingredient of the shared photo — kept for a future photo history. Private; written only by `sign-photo` (no INSERT/UPDATE policy exists, so no client can plant an "original"); its owner can SELECT and DELETE; nobody else, anon included, can read it.
+
+**`users.watermark_enabled`** (`supabase/sql/2026-10-09_account_settings.sql`): the app's **Photo Fingerprint** switch, `not null default true`. Off ⇒ the app signs the raw capture as-is with no visible mark. Read and written by the app as a one-column query, never in the whole-row `HumanUser` upsert, so older builds are unaffected. Claims nothing — the manifest is the proof either way.
 
 **App Attest tables** (`supabase/sql/2026-09-25_app_attest.sql`, the record of what to apply): `app_attest_keys` (key id → attested public key, environment, highest counter seen) and `app_attest_challenges` (single-use registration challenges). Both have RLS **on with no policies** — reachable only by the Edge Functions' service role, never through PostgREST.
 
