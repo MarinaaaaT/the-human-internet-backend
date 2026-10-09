@@ -7,11 +7,18 @@
 // reach by design: `auth.users` can only be deleted through the admin API,
 // and `photo-originals` has no client-writable policy beyond DELETE. The
 // caller is identified from their own forwarded JWT first, and every
-// privileged operation below is scoped to that one id — nothing in the
-// request body is read at all, so there's no way to name someone else.
+// privileged operation below is scoped to that one id. The request body
+// carries only an Apple authorization code (below), never a user id, so
+// there's no way to name someone else.
 //
-// Order matters, and mirrors the app's `PhotoRepository.delete`: rows first,
-// files second, identity last.
+// Order matters. Apple first, then the app's `PhotoRepository.delete` order:
+// rows, files, identity last.
+// 0. Revoke Sign in with Apple — see `appleRevocation.ts`. Required for any
+//    account with an Apple identity (today, all of them): the body must
+//    carry `apple_authorization_code`, fresh from the user re-confirming
+//    with Apple. If it fails nothing has been deleted; if it succeeds and a
+//    later step fails, signing back in with Apple re-links and the retry
+//    revokes again.
 // 1. `photos` rows — what `get_verification_photo()` reads, so deleting them
 //    is what actually kills every shared link, immediately.
 // 2. Storage objects in `photos` and `photo-originals`.
@@ -23,6 +30,7 @@
 // retry the cleanup.
 
 import { createClient } from "npm:@supabase/supabase-js@2";
+import { AppleRevocationError, revokeAppleSignIn } from "./appleRevocation.ts";
 
 /// Every bucket that holds per-user files under a `{user_id}/` prefix.
 const BUCKETS = ["photos", "photo-originals"];
@@ -79,6 +87,26 @@ Deno.serve(async (req) => {
     return json({ error: "Not authenticated" }, 401);
   }
   const userID = user.id.toLowerCase();
+
+  const appleIdentity = user.identities?.find((identity) => identity.provider === "apple");
+  if (appleIdentity) {
+    const body = await req.json().catch(() => ({}));
+    const code = typeof body.apple_authorization_code === "string" ? body.apple_authorization_code : "";
+    if (!code) {
+      return json({ error: "Apple confirmation required", code: "apple_code_missing" }, 400);
+    }
+    const appleUserID = String(appleIdentity.identity_data?.sub ?? appleIdentity.id);
+    try {
+      await revokeAppleSignIn(code, appleUserID);
+    } catch (error) {
+      console.error(`delete-account: Apple revocation failed for ${userID}:`, error);
+      const reason = error instanceof AppleRevocationError ? error.code : "apple_revoke_failed";
+      // The user's own fault (a stale code, the wrong Apple ID) is a 400 the
+      // app can explain; anything else is ours.
+      const status = reason === "apple_code_invalid" || reason === "apple_account_mismatch" ? 400 : 500;
+      return json({ error: "Couldn't confirm with Apple", code: reason }, status);
+    }
+  }
 
   try {
     const { error: photosError } = await supabaseAdmin
