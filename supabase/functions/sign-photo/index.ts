@@ -1,7 +1,7 @@
 // Forwards a raw captured JPEG to the AWS Lambda that holds the real C2PA
 // signing key (in AWS KMS — never in this function, never in the app) and
-// returns the signed JPEG bytes. RemotePhotoSigner.swift calls this for every
-// photo the iOS app uploads.
+// returns the signed JPEG bytes. `RemotePhotoSigner` (iOS and Android) calls
+// this for every photo the apps upload.
 //
 // Runs with the caller's own JWT forwarded by `supabase.functions.invoke`,
 // so this only ever signs a photo on behalf of the authenticated user
@@ -22,6 +22,14 @@
 // Errors carry a `code` the app acts on: `attestation_key_unknown` and
 // `attestation_invalid` make it discard its key and register a fresh one.
 //
+// **Play Integrity** is the same gate for Android, which has no App Attest:
+// a request may carry `X-Play-Integrity-Token`, a Google Play Integrity token
+// the app requested over SHA-256 of the exact body. It counts as attested
+// when Google decodes it to a Play-installed build of our app on a genuine
+// device (`_shared/playIntegrity.ts`). The one flag governs both platforms —
+// see `checkPlayIntegrity` for how its failure handling differs from App
+// Attest's, and why.
+//
 // **Capture pipeline** (`X-Capture-Pipeline: server-watermark-v1` +
 // `X-Photo-Id`): the body is the *raw* capture. It's signed as a capture,
 // the Lambda burns the brand mark into that signed capture and signs the
@@ -34,13 +42,21 @@
 //
 // Required secrets (`supabase secrets set`): SIGNING_LAMBDA_URL,
 // AWS_REGION, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY. Until those are
-// set this function 500s.
+// set this function 500s. Optional: PLAY_INTEGRITY_SERVICE_ACCOUNT (a Google
+// service account key, JSON) — without it no Android request can be attested.
 
 import { createClient } from "npm:@supabase/supabase-js@2";
 import { SignatureV4 } from "npm:@aws-sdk/signature-v4@3";
 import { HttpRequest } from "npm:@aws-sdk/protocol-http@3";
 import { Sha256 } from "npm:@aws-crypto/sha256-js@5";
 import { AppAttestError, fromBase64, verifyAssertion } from "../_shared/appAttest.ts";
+import {
+  decodeIntegrityToken,
+  evaluateVerdict,
+  expectedRequestHash,
+  loadServiceAccount,
+  PlayIntegrityError,
+} from "../_shared/playIntegrity.ts";
 
 const LAMBDA_FUNCTION_URL = Deno.env.get("SIGNING_LAMBDA_URL")!;
 const AWS_REGION = Deno.env.get("AWS_REGION")!;
@@ -50,6 +66,10 @@ const AWS_REGION = Deno.env.get("AWS_REGION")!;
 /// default, since failing closed on a flag we couldn't read would stop every
 /// upload from every build that predates attestation.
 const REQUIRE_APP_ATTEST_FLAG = "require_app_attest";
+
+/// Carries the Android app's Play Integrity token. Mirrored in the Android
+/// app's `PlayIntegrityService`.
+const PLAY_INTEGRITY_HEADER = "X-Play-Integrity-Token";
 
 /// Opts a request into the capture pipeline, and is echoed on the response
 /// so the app can tell a backend that did the watermarking from one that
@@ -249,6 +269,10 @@ async function checkAppAttest(
   const assertion = req.headers.get("X-App-Attest-Assertion");
 
   if (!keyId || !assertion) {
+    const integrityToken = req.headers.get(PLAY_INTEGRITY_HEADER);
+    if (integrityToken) {
+      return await checkPlayIntegrity(integrityToken, imageData, userId, supabaseClient);
+    }
     if (await isAppAttestRequired(userId, supabaseClient)) {
       return refuse(403, "attestation_required");
     }
@@ -293,6 +317,47 @@ async function checkAppAttest(
   return null;
 }
 
+/// The Android half of `checkAppAttest`: returns a response to send instead
+/// of signing, or null to go ahead.
+///
+/// Where it differs from App Attest, and why: a failed App Attest assertion
+/// is refused even while the flag is off, because every build that sends one
+/// can produce a valid one. That isn't true here — a debug build, or any
+/// build on the emulator, gets a real token that Google marks unrecognized.
+/// So the flag alone decides:
+///   - attestation not required for this caller ⇒ any failure is logged and
+///     the photo is signed, exactly as if no token had been sent;
+///   - required ⇒ the token must pass in full. There is no exemption for
+///     admins or for development builds: with the flag on, Android signs
+///     only from a Play-installed build on a genuine device.
+async function checkPlayIntegrity(
+  token: string,
+  imageData: Uint8Array,
+  userId: string,
+  // deno-lint-ignore no-explicit-any
+  supabaseClient: any,
+): Promise<Response | null> {
+  try {
+    const serviceAccount = loadServiceAccount();
+    if (!serviceAccount) throw new PlayIntegrityError("Play Integrity is not configured");
+
+    const payload = await decodeIntegrityToken(token, serviceAccount);
+    evaluateVerdict(payload, { expectedRequestHash: await expectedRequestHash(imageData) });
+    return null;
+  } catch (error) {
+    if (!(await isAppAttestRequired(userId, supabaseClient))) {
+      console.warn("Signing despite a failed Play Integrity check", { user: userId, reason: String(error) });
+      return null;
+    }
+    if (error instanceof PlayIntegrityError) {
+      console.warn("Rejected Play Integrity token", { user: userId, reason: error.message });
+      return refuse(403, "attestation_invalid");
+    }
+    // Couldn't reach Google: an outage, not a verdict. 500, and the app retries.
+    throw error;
+  }
+}
+
 async function isAppAttestRequired(
   userId: string,
   // deno-lint-ignore no-explicit-any
@@ -307,7 +372,11 @@ async function isAppAttestRequired(
 
   if (flag?.audience === "all") return true;
   if (flag?.audience !== "admin") return false;
+  return await isAdmin(userId, supabaseClient);
+}
 
+// deno-lint-ignore no-explicit-any
+async function isAdmin(userId: string, supabaseClient: any): Promise<boolean> {
   // Self-scoped RLS: this is the caller's own row, and the is_admin triggers
   // stop them writing it.
   const { data: profile, error: profileError } = await supabaseClient
@@ -320,7 +389,7 @@ async function isAppAttestRequired(
 }
 
 function refuse(status: number, code: string): Response {
-  return new Response(JSON.stringify({ error: "App Attest check failed", code }), {
+  return new Response(JSON.stringify({ error: "Attestation check failed", code }), {
     status,
     headers: { "Content-Type": "application/json" },
   });
