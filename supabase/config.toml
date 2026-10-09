@@ -12,3 +12,6 @@ verify_jwt = true
 
 [functions.app-attest-register]
 verify_jwt = true
+
+[functions.delete-account]
+verify_jwt = true
