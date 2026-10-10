@@ -5,16 +5,29 @@
 //! had already signed, rather than bytes a client says it watermarked — the
 //! second manifest then records an edit the signer actually performed.
 //!
-//! **The mark is an image: `assets/brand-mark.png`.** The same file ships in
-//! the app's asset catalog as `BrandMarkWatermark`, where `PhotoWatermarker`
-//! (legacy/Skip-C2PA paths) and `ProvisionalWatermark` (the overlay drawn
-//! over a capture still processing) draw it. To change the artwork, replace
-//! the PNG in both places — nothing else. Placement is the other half of the
-//! contract, and is stated relative to the image so any artwork fits: width
-//! 9% of the photo's shorter side, height from the PNG's own aspect ratio,
-//! inset 3.5% of the shorter side from the top-trailing corner. Artwork
-//! should be sRGB, transparent where it isn't mark, and at least ~600px wide
-//! (9% of a 48MP capture's shorter side is 544px).
+//! **The mark is an image: `assets/brand-mark.png`** — the spiral
+//! "fingerprint", rendered from the website's `public/brand/mark.svg`. The
+//! same file ships in the iOS app (`BrandMarkWatermark`) and the Android app
+//! (`brand_mark_watermark`), where the on-device watermarkers and the
+//! provisional overlay (drawn over a capture still processing) draw it. To
+//! change the artwork, replace the PNG in all three repos — nothing else.
+//! Only its **alpha** is used: it is the mark's shape, not its colour.
+//!
+//! **Colour adapts to the photo.** The mark is filled solid black or solid
+//! white, whichever reads against the part of the photo it sits on — like the
+//! iOS tab bar's glyphs over the live camera. [`mark_color`] decides, and all
+//! four renderers implement the same rule: sample a 32×32 grid of points
+//! across the mark's box, average their Rec. 709 luma (on the encoded 0–1
+//! values), and draw black above 0.5, white at or below. The provisional
+//! overlay samples a downscaled preview of the same capture, so for a box that
+//! averages right at the threshold the two can disagree — the overlay is a
+//! placeholder, and this is the colour that ships.
+//!
+//! Placement is the other half of the contract, and is stated relative to the
+//! image so any artwork fits: width 9% of the photo's shorter side, height
+//! from the PNG's own aspect ratio, inset 3.5% of the shorter side from the
+//! top-trailing corner. Artwork should be transparent where it isn't mark and
+//! at least ~600px wide (9% of a 48MP capture's shorter side is 544px).
 
 use anyhow::{Context, Result};
 use image::{
@@ -28,6 +41,10 @@ use std::sync::OnceLock;
 pub const MARK_SIZE_FRACTION: f32 = 0.09;
 /// Inset from the top and trailing edges, same basis.
 pub const MARK_PADDING_FRACTION: f32 = 0.035;
+/// Sample points per side of the grid [`mark_color`] averages.
+pub const COLOR_SAMPLE_GRID: u32 = 32;
+/// Mean luma above which the background counts as light, and the mark is black.
+pub const LIGHT_BACKGROUND_LUMA: f32 = 0.5;
 /// Matches `UIImage.jpegData(compressionQuality: 0.95)` in `PhotoWatermarker`.
 const JPEG_QUALITY: u8 = 95;
 
@@ -80,24 +97,55 @@ pub fn mark_placement(width: u32, height: u32) -> (f32, f32, f32) {
     (width as f32 - size - padding, padding, size)
 }
 
-/// The artwork, decoded once per Lambda instance, with its alpha
-/// premultiplied so resampling doesn't drag the (meaningless) colour of
-/// transparent pixels into the mark's edges as a dark fringe.
+/// The artwork, decoded once per Lambda instance. Only its alpha channel is
+/// read, so resampling it can't drag any colour into the mark's edges.
 fn brand_mark() -> Result<&'static Rgba32FImage> {
     static MARK: OnceLock<Rgba32FImage> = OnceLock::new();
     if let Some(mark) = MARK.get() {
         return Ok(mark);
     }
-    let mut mark = image::load_from_memory(BRAND_MARK_PNG)
+    let mark = image::load_from_memory(BRAND_MARK_PNG)
         .context("brand-mark.png is not a decodable image")?
         .into_rgba32f();
-    for px in mark.pixels_mut() {
-        let a = px.0[3];
-        for c in &mut px.0[..3] {
-            *c *= a;
+    Ok(MARK.get_or_init(|| mark))
+}
+
+/// Which solid colour the mark is filled with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MarkColor {
+    Black,
+    White,
+}
+
+impl MarkColor {
+    fn rgb(self) -> [f32; 3] {
+        match self {
+            MarkColor::Black => [0.0; 3],
+            MarkColor::White => [1.0; 3],
         }
     }
-    Ok(MARK.get_or_init(|| mark))
+}
+
+/// Black on a light background, white on a dark one — see the module docs for
+/// the rule, which the apps implement identically. `(x, y, width, height)` is
+/// the mark's box in `image`'s pixels.
+pub fn mark_color(image: &RgbImage, x: f32, y: f32, width: f32, height: f32) -> MarkColor {
+    let n = COLOR_SAMPLE_GRID;
+    let (max_x, max_y) = (image.width().saturating_sub(1), image.height().saturating_sub(1));
+    let mut total = 0.0f32;
+    for j in 0..n {
+        for i in 0..n {
+            let px = (x + (i as f32 + 0.5) * width / n as f32).floor().clamp(0.0, max_x as f32) as u32;
+            let py = (y + (j as f32 + 0.5) * height / n as f32).floor().clamp(0.0, max_y as f32) as u32;
+            let [r, g, b] = image.get_pixel(px, py).0;
+            total += (0.2126 * r as f32 + 0.7152 * g as f32 + 0.0722 * b as f32) / 255.0;
+        }
+    }
+    if total / (n * n) as f32 > LIGHT_BACKGROUND_LUMA {
+        MarkColor::Black
+    } else {
+        MarkColor::White
+    }
 }
 
 /// The artwork's height / width.
@@ -109,6 +157,13 @@ pub fn mark_aspect_ratio() -> Result<f32> {
 fn draw_mark(image: &mut RgbImage, to_display_p3: bool) -> Result<()> {
     let (x, y, width) = mark_placement(image.width(), image.height());
     let height = width * mark_aspect_ratio()?;
+    // Decided before anything is drawn, from the photo alone.
+    let mut color = mark_color(image, x, y, width, height).rgb();
+    if to_display_p3 {
+        // A no-op for pure black and white, which are the same in both
+        // spaces; kept so any future fill colour stays colour-managed.
+        color = srgb_to_display_p3(color);
+    }
     let scaled = imageops::resize(
         brand_mark()?,
         width.round().max(1.0) as u32,
@@ -122,14 +177,10 @@ fn draw_mark(image: &mut RgbImage, to_display_p3: bool) -> Result<()> {
         if dx < 0 || dy < 0 || dx >= image.width() as i64 || dy >= image.height() as i64 {
             continue;
         }
-        // Lanczos rings slightly past [0, 1]; clamp before un-premultiplying.
+        // Lanczos rings slightly past [0, 1].
         let alpha = px.0[3].clamp(0.0, 1.0);
         if alpha <= 0.0 {
             continue;
-        }
-        let mut color = [px.0[0], px.0[1], px.0[2]].map(|c| (c / alpha).clamp(0.0, 1.0));
-        if to_display_p3 {
-            color = srgb_to_display_p3(color);
         }
         let dst = image.get_pixel_mut(dx as u32, dy as u32);
         for (d, s) in dst.0.iter_mut().zip(color) {
@@ -174,7 +225,11 @@ mod tests {
     use image::{GenericImageView, Rgb};
 
     fn gray_jpeg(width: u32, height: u32) -> Vec<u8> {
-        let img = RgbImage::from_pixel(width, height, Rgb([40, 40, 40]));
+        solid_jpeg(width, height, 40)
+    }
+
+    fn solid_jpeg(width: u32, height: u32, level: u8) -> Vec<u8> {
+        let img = RgbImage::from_pixel(width, height, Rgb([level; 3]));
         let mut out = Vec::new();
         JpegEncoder::new_with_quality(&mut out, 95)
             .write_image(img.as_raw(), width, height, ExtendedColorType::Rgb8)
@@ -186,13 +241,22 @@ mod tests {
         image::load_from_memory(jpeg).unwrap().into_rgb8()
     }
 
-    /// The stand-in artwork's colour — `Theme.accentPink`.
-    const PINK_SRGB: [u8; 3] = [227, 168, 222];
+    fn is_white(p: &Rgb<u8>) -> bool {
+        p.0.iter().all(|&c| c > 235)
+    }
 
-    fn is_pink(p: &Rgb<u8>) -> bool {
-        p.0[0].abs_diff(PINK_SRGB[0]) < 12
-            && p.0[1].abs_diff(PINK_SRGB[1]) < 12
-            && p.0[2].abs_diff(PINK_SRGB[2]) < 12
+    fn is_black(p: &Rgb<u8>) -> bool {
+        p.0.iter().all(|&c| c < 20)
+    }
+
+    /// A point on the spiral's solid stroke, in mark-box fractions: the
+    /// outer ring (1–12% across, halfway down the artwork).
+    const ON_STROKE: (f32, f32) = (0.065, 0.5);
+    /// The gap between the outer ring and the next (13–20%), same row.
+    const OFF_STROKE: (f32, f32) = (0.165, 0.5);
+
+    fn at(out: &RgbImage, x: f32, y: f32, size: f32, aspect: f32, (fx, fy): (f32, f32)) -> Rgb<u8> {
+        *out.get_pixel((x + size * fx) as u32, (y + size * aspect * fy) as u32)
     }
 
     #[test]
@@ -202,15 +266,51 @@ mod tests {
 
         let (x, y, size) = mark_placement(1000, 800);
         assert_eq!((x, y, size), (1000.0 - 72.0 - 28.0, 28.0, 72.0));
-        // Middle of the top capsule, and middle of the body below it.
-        assert!(is_pink(out.get_pixel((x + size / 2.0) as u32, (y + size * 0.11) as u32)));
-        assert!(is_pink(out.get_pixel((x + size / 2.0) as u32, (y + size * 0.5) as u32)));
-        // Beside the body, under the capsule's overhang: background.
-        assert!(!is_pink(out.get_pixel((x + size * 0.1) as u32, (y + size * 0.6) as u32)));
+        let aspect = mark_aspect_ratio().unwrap();
+        assert!(is_white(&at(&out, x, y, size, aspect, ON_STROKE)), "dark photo, white mark");
+        assert!(!is_white(&at(&out, x, y, size, aspect, OFF_STROKE)), "the spiral's gaps stay photo");
         // Other corners untouched.
         for (px, py) in [(10, 10), (10, 790), (990, 790)] {
-            assert!(!is_pink(out.get_pixel(px, py)));
+            assert!(!is_white(out.get_pixel(px, py)));
         }
+    }
+
+    #[test]
+    fn the_mark_is_black_on_a_light_photo_and_white_on_a_dark_one() {
+        let (x, y, size) = mark_placement(1000, 800);
+        let aspect = mark_aspect_ratio().unwrap();
+        let light = decode(&watermark_jpeg(&solid_jpeg(1000, 800, 230)).unwrap());
+        assert!(is_black(&at(&light, x, y, size, aspect, ON_STROKE)));
+        let dark = decode(&watermark_jpeg(&solid_jpeg(1000, 800, 25)).unwrap());
+        assert!(is_white(&at(&dark, x, y, size, aspect, ON_STROKE)));
+    }
+
+    /// Only the box the mark covers decides — not the rest of the photo.
+    #[test]
+    fn colour_is_decided_by_the_area_under_the_mark() {
+        let mut img = RgbImage::from_pixel(1000, 800, Rgb([20; 3]));
+        let (x, y, size) = mark_placement(1000, 800);
+        let h = size * mark_aspect_ratio().unwrap();
+        for py in y as u32..(y + h).ceil() as u32 {
+            for px in x as u32..(x + size).ceil() as u32 {
+                img.put_pixel(px, py, Rgb([240; 3]));
+            }
+        }
+        assert_eq!(mark_color(&img, x, y, size, h), MarkColor::Black);
+        assert_eq!(mark_color(&RgbImage::from_pixel(1000, 800, Rgb([240; 3])), x, y, size, h), MarkColor::Black);
+        assert_eq!(mark_color(&RgbImage::from_pixel(1000, 800, Rgb([20; 3])), x, y, size, h), MarkColor::White);
+    }
+
+    /// Pins the threshold the apps mirror: mid-grey (luma exactly 0.5 sits
+    /// just under 128/255) gets white; one step brighter, black.
+    #[test]
+    fn the_threshold_is_half_luma() {
+        let (x, y, size) = (0.0, 0.0, 64.0);
+        assert_eq!(mark_color(&RgbImage::from_pixel(64, 64, Rgb([127; 3])), x, y, size, size), MarkColor::White);
+        assert_eq!(mark_color(&RgbImage::from_pixel(64, 64, Rgb([128; 3])), x, y, size, size), MarkColor::Black);
+        // Luma, not a plain average: pure green reads light, pure blue dark.
+        assert_eq!(mark_color(&RgbImage::from_pixel(64, 64, Rgb([0, 255, 0])), x, y, size, size), MarkColor::Black);
+        assert_eq!(mark_color(&RgbImage::from_pixel(64, 64, Rgb([0, 0, 255])), x, y, size, size), MarkColor::White);
     }
 
     #[test]
@@ -224,34 +324,37 @@ mod tests {
     /// on the upright image, and the output must be upright.
     #[test]
     fn exif_orientation_is_applied_before_placing_the_mark() {
-        let landscape = gray_jpeg(400, 300);
+        let landscape = gray_jpeg(1200, 900);
         let tagged = with_exif_orientation(&landscape, 6);
         let out = decode(&watermark_jpeg(&tagged).unwrap());
-        assert_eq!(out.dimensions(), (300, 400), "output should be the upright portrait");
+        assert_eq!(out.dimensions(), (900, 1200), "output should be the upright portrait");
 
-        let (x, y, size) = mark_placement(300, 400);
-        assert!(is_pink(out.get_pixel((x + size / 2.0) as u32, (y + size * 0.5) as u32)));
+        let (x, y, size) = mark_placement(900, 1200);
+        let aspect = mark_aspect_ratio().unwrap();
+        assert!(is_white(&at(&out, x, y, size, aspect, ON_STROKE)));
     }
 
-    /// `Theme.accentPink` in P3, as UIKit would convert it: (218, 171, 219).
+    /// Display P3 shares sRGB's white point and transfer curve: greys,
+    /// including the mark's black and white, convert to themselves.
     #[test]
-    fn srgb_pink_converts_to_the_expected_display_p3_values() {
-        let p3 = srgb_to_display_p3(PINK_SRGB.map(|c| c as f32 / 255.0)).map(|c| (c * 255.0).round() as u8);
-        for (got, want) in p3.iter().zip([218u8, 171, 219]) {
-            assert!(got.abs_diff(want) <= 1, "{p3:?}");
+    fn greys_are_unchanged_by_the_display_p3_conversion() {
+        for v in [0.0, 0.5, 1.0] {
+            let p3 = srgb_to_display_p3([v; 3]);
+            assert!(p3.iter().all(|c| (c - v).abs() < 0.002), "{p3:?}");
         }
-        // Greys are the same in both spaces.
-        let grey = srgb_to_display_p3([0.5, 0.5, 0.5]);
-        assert!(grey.iter().all(|c| (c - 0.5).abs() < 0.002), "{grey:?}");
+        // A saturated colour does move: pure sRGB red sits inside P3.
+        let red = srgb_to_display_p3([1.0, 0.0, 0.0]);
+        assert!(red[0] < 0.95 && red[1] > 0.1, "{red:?}");
     }
 
-    /// Must be the same PNG as the app's `BrandMarkWatermark` image set —
-    /// the app's `CapturePipelineTests` pins the same dimensions. When the
-    /// artwork changes, replace it in both repos and update both tests.
+    /// Must be the same PNG as the iOS `BrandMarkWatermark` image set and
+    /// Android's `brand_mark_watermark` — `CapturePipelineTests` and
+    /// `PhotoWatermarkerTest` pin the same dimensions. When the artwork
+    /// changes, replace it in all three repos and update all three tests.
     #[test]
     fn artwork_is_the_shared_png_and_large_enough_for_a_48mp_capture() {
         let mark = brand_mark().unwrap();
-        assert_eq!(mark.dimensions(), (1024, 860));
+        assert_eq!(mark.dimensions(), (1024, 1082));
         assert!(mark.width() >= 544, "a 48MP capture's mark is 544px wide");
     }
 
@@ -279,7 +382,7 @@ mod tests {
         out.extend_from_slice(&payload);
         out.extend_from_slice(&jpeg[2..]);
         let decoded = image::load_from_memory(&out).unwrap();
-        assert_eq!(decoded.dimensions(), (400, 300), "fixture should decode un-rotated");
+        assert_eq!(decoded.dimensions(), (1200, 900), "fixture should decode un-rotated");
         out
     }
 }
