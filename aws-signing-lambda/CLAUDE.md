@@ -57,18 +57,23 @@ non-technical process — see the app repo's `CLAUDE.md` Known Gap #1).
 - `src/watermark.rs` — composites the brand mark, **an image:
   `assets/brand-mark.png`** (embedded with `include_bytes!`), onto the
   decoded capture: width 9% of the shorter side, height from the PNG's own
-  aspect ratio, inset 3.5%, top-trailing; resampled with alpha
-  premultiplied (no dark fringe), and converted sRGB → Display P3 when the
-  capture is tagged P3, which iPhone captures are. **EXIF orientation is
-  applied first** — an iPhone stores portraits sideways and tagged — and the
-  ICC profile is kept; other metadata is dropped. **The same PNG is the
-  app's `BrandMarkWatermark` image set**, drawn by `PhotoWatermarker` and
-  the processing overlay `ProvisionalWatermark`; to change the artwork,
-  replace it in both repos (sRGB, transparent background, ≥ ~600px wide) and
-  update the dimension check in each repo's tests. The current file is a
-  render of the old vector `BrandMark`, standing in until real artwork.
-- **Tests** (`cargo test --release`): the watermark's placement and
-  orientation handling, and both manifests read back through `c2pa::Reader`
+  aspect ratio, inset 3.5%, top-trailing. The PNG is the spiral
+  "fingerprint" (rendered from the website's `public/brand/mark.svg`) and
+  **only its alpha is used**: the mark is filled **solid black or solid
+  white, whichever reads against the photo under it** — `mark_color`
+  samples a 32×32 grid across the mark's box, averages Rec. 709 luma on the
+  encoded values, and picks black above 0.5, white at or below. The iOS and
+  Android apps implement the same rule (on-device watermarker and the
+  processing overlay), so the overlay and the burned-in mark agree except
+  for a box averaging right at the threshold. **EXIF orientation is applied
+  first** — an iPhone stores portraits sideways and tagged — and the ICC
+  profile is kept; other metadata is dropped. **The same PNG is the iOS
+  app's `BrandMarkWatermark` image set and Android's
+  `brand_mark_watermark`**; to change the artwork, replace it in all three
+  repos (transparent background, ≥ ~600px wide) and update the dimension
+  check in each repo's tests (1024×1082 today).
+- **Tests** (`cargo test --release`): the watermark's placement, colour
+  rule and orientation handling, and both manifests read back through `c2pa::Reader`
   — `Valid`, with `signingCredential.untrusted` the only failure, the
   capture's `digitalCapture` claim surviving inside the ingredient. They sign
   with a throwaway CA minted per run by `rcgen`; no key is committed.
