@@ -47,6 +47,17 @@ pub const COLOR_SAMPLE_GRID: u32 = 32;
 pub const LIGHT_BACKGROUND_LUMA: f32 = 0.5;
 /// Matches `UIImage.jpegData(compressionQuality: 0.95)` in `PhotoWatermarker`.
 const JPEG_QUALITY: u8 = 95;
+/// Lower qualities tried, in order, when a photo at [`JPEG_QUALITY`] would be
+/// too big to send back. See [`MAX_WATERMARKED_JPEG_BYTES`].
+const FALLBACK_JPEG_QUALITIES: [u8; 6] = [90, 85, 80, 75, 70, 60];
+/// Cap on the watermarked JPEG before it's signed. A Function URL response is
+/// limited to 6MB *after* base64 (×4/3), and the signed photo also carries the
+/// C2PA manifest with the capture as an ingredient (≈100–200KB). Re-encoding
+/// a large, detailed capture at quality 95 can come out bigger than the
+/// iPhone's own JPEG, and over the limit the runtime answers `413 Payload Too
+/// Large` and the upload fails for good — every retry re-encodes the same
+/// bytes. 4MB leaves room for both: (4MB + manifest) × 4/3 ≈ 5.6MB.
+pub const MAX_WATERMARKED_JPEG_BYTES: usize = 4_000_000;
 
 /// The artwork. Identical to the app's `BrandMarkWatermark` image set.
 const BRAND_MARK_PNG: &[u8] = include_bytes!("../assets/brand-mark.png");
@@ -77,11 +88,31 @@ pub fn watermark_jpeg(jpeg: &[u8]) -> Result<Vec<u8>> {
         .is_some_and(|icc| contains(icc, b"Display P3") || contains(icc, &utf16be("Display P3")));
     draw_mark(&mut rgb, is_display_p3)?;
 
+    encode_within(&rgb, icc_profile.as_deref(), MAX_WATERMARKED_JPEG_BYTES)
+}
+
+/// Encodes at [`JPEG_QUALITY`], stepping down through
+/// [`FALLBACK_JPEG_QUALITIES`] only if the result is over `max_bytes`. Almost
+/// every photo stays at 95; a huge, detailed one loses a little quality rather
+/// than failing to upload. Returns the last attempt if even the lowest
+/// quality is over — still better than a guaranteed 413.
+fn encode_within(rgb: &RgbImage, icc_profile: Option<&[u8]>, max_bytes: usize) -> Result<Vec<u8>> {
     let mut out = Vec::new();
-    let mut encoder = JpegEncoder::new_with_quality(&mut out, JPEG_QUALITY);
+    for quality in std::iter::once(JPEG_QUALITY).chain(FALLBACK_JPEG_QUALITIES) {
+        out = encode(rgb, icc_profile, quality)?;
+        if out.len() <= max_bytes {
+            break;
+        }
+    }
+    Ok(out)
+}
+
+fn encode(rgb: &RgbImage, icc_profile: Option<&[u8]>, quality: u8) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut encoder = JpegEncoder::new_with_quality(&mut out, quality);
     if let Some(icc) = icc_profile {
         // Unsupported only for formats without ICC support; JPEG has it.
-        let _ = encoder.set_icc_profile(icc);
+        let _ = encoder.set_icc_profile(icc.to_vec());
     }
     encoder.write_image(rgb.as_raw(), rgb.width(), rgb.height(), ExtendedColorType::Rgb8)?;
     Ok(out)
@@ -356,6 +387,47 @@ mod tests {
         let mark = brand_mark().unwrap();
         assert_eq!(mark.dimensions(), (1024, 1082));
         assert!(mark.width() >= 544, "a 48MP capture's mark is 544px wide");
+    }
+
+    /// Pseudo-random noise: the worst case for JPEG, like a big, detailed photo.
+    fn noise(width: u32, height: u32) -> RgbImage {
+        let mut state = 0x2545_f491_u32;
+        RgbImage::from_fn(width, height, |_, _| {
+            let mut px = [0u8; 3];
+            for c in &mut px {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                *c = state as u8;
+            }
+            Rgb(px)
+        })
+    }
+
+    #[test]
+    fn a_photo_that_fits_stays_at_full_quality() {
+        let img = noise(200, 200);
+        let full = encode(&img, None, JPEG_QUALITY).unwrap();
+        assert_eq!(encode_within(&img, None, full.len()).unwrap(), full);
+    }
+
+    /// Over the cap, quality steps down until it fits — rather than sending
+    /// a response the Lambda runtime refuses with a 413.
+    #[test]
+    fn a_photo_over_the_cap_is_re_encoded_smaller() {
+        let img = noise(400, 400);
+        let full = encode(&img, None, JPEG_QUALITY).unwrap();
+        let cap = full.len() * 3 / 4;
+        let capped = encode_within(&img, None, cap).unwrap();
+        assert!(capped.len() <= cap, "{} > {cap}", capped.len());
+        assert_eq!(image::load_from_memory(&capped).unwrap().dimensions(), (400, 400));
+    }
+
+    /// The cap leaves room for base64 and the manifest under the 6MB limit.
+    #[test]
+    fn the_cap_fits_the_function_url_limit_with_room_for_the_manifest() {
+        let with_manifest = MAX_WATERMARKED_JPEG_BYTES + 300_000;
+        assert!(with_manifest.div_ceil(3) * 4 < 6 * 1024 * 1024);
     }
 
     #[test]
