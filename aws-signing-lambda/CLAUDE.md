@@ -109,6 +109,39 @@ If the resulting binary fails at Lambda cold start with a glibc mismatch
 `cargo lambda build --release --arm64` instead — see the Dockerfile's
 comment.
 
+## Deploying
+
+Merging to `main` does **not** deploy the Lambda (only the Edge Functions
+have a workflow). Deploy by hand, from an up-to-date `main`. The function
+lives in **`us-east-2`**, account `141218266378`; the `signing-admin` SSO
+profile has the rights (`aws sso login --profile signing-admin`).
+
+```bash
+export AWS_PROFILE=signing-admin AWS_REGION=us-east-2
+REPO=141218266378.dkr.ecr.us-east-2.amazonaws.com/human-internet-signing-lambda
+TAG=$(git rev-parse --short HEAD)
+
+# Note the current image first — it is the rollback.
+aws lambda get-function --function-name c2pa-signer --query Code.ResolvedImageUri
+
+docker build -t human-internet-signing-lambda:latest .   # arm64; see Building
+aws ecr get-login-password | docker login --username AWS --password-stdin ${REPO%%/*}
+docker tag human-internet-signing-lambda:latest $REPO:$TAG
+docker push $REPO:$TAG
+DIGEST=$(aws ecr describe-images --repository-name human-internet-signing-lambda \
+  --image-ids imageTag=$TAG --query 'imageDetails[0].imageDigest' --output text)
+aws lambda update-function-code --function-name c2pa-signer --image-uri $REPO@$DIGEST
+aws lambda wait function-updated-v2 --function-name c2pa-signer
+```
+
+Point the function at a **digest**, not a tag, so what's running is exactly
+what was built and the previous digest is a one-line rollback
+(`update-function-code --image-uri $REPO@<old digest>`). Then smoke-test
+`/capture` → `/watermark` as below and check both the manifest and the
+mark. Deploy history: 2026-09-25 `sha256:d572c32…` (server-side
+watermark); 2026-10-10 `sha256:6c22a64…` (fingerprint mark, adaptive
+black/white).
+
 ## Gotchas already hit and fixed here
 
 1. **`lambda_http::Body` is `#[non_exhaustive]`** in the pinned
