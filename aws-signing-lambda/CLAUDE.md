@@ -130,10 +130,25 @@ comment.
 - Function URL (`AWS_IAM` auth) — invoked by IAM user `c2pa-signer-invoker`
   (scoped to `lambda:InvokeFunctionUrl` on this function only; its access
   key lives in the app repo's Supabase project secrets, never here)
-- Reserved concurrency is **not** set (would cap abuse at 5 concurrent
-  invocations) — blocked on the AWS account's default new-account
-  concurrency limit of 10, which doesn't leave room for a 5-wide
-  reservation. Revisit once the account's limit is raised.
+- Reserved concurrency is set to **5** (`aws lambda put-function-concurrency
+  --function-name c2pa-signer --reserved-concurrent-executions 5`), capping
+  abuse at 5 concurrent invocations. This was blocked until 2026-10-10 by
+  the account's default new-account concurrency limit of 10 — Lambda
+  requires at least 10 unreserved concurrency to remain in the account pool,
+  so no reservation was possible under that ceiling. Raised via a Service
+  Quotas increase request (`L-B99A9384`, account `141218266378`,
+  us-east-2) from 10 to the standard default of 1000, auto-reviewed and
+  approved same-day with no manual follow-up; `aws lambda
+  get-account-settings` now reports `ConcurrentExecutions: 1000`. 5 stays
+  deliberately far below both that new ceiling and the downstream limits
+  that would otherwise throttle under real concurrency: the KMS key's
+  shared `Cryptographic operations (ECC & SM2)` quota is 1000 req/s
+  account-wide, and this Lambda spends up to 2 `Sign` calls per photo
+  (`/capture` + `/watermark`); SSM's `GetParameter` quota (read once per
+  cold start, for the cert chain) is only 40 req/s, so an uncapped burst of
+  concurrent cold starts would throttle there first. If real traffic ever
+  needs to grow past 5, raise this deliberately rather than removing the
+  reservation.
 
 ## Testing without going through the Function URL
 
