@@ -1936,6 +1936,8 @@ dependencies = [
  "lambda_http",
  "p256",
  "rcgen",
+ "reqwest",
+ "serde",
  "serde_json",
  "sha2 0.10.9",
  "tokio",

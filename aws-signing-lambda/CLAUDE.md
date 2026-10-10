@@ -54,6 +54,18 @@ non-technical process — see the app repo's `CLAUDE.md` Known Gap #1).
   `digitalSourceType` and the typed builders don't reliably produce that.
   `/watermark` refuses input with no C2PA manifest, so the ingredient is
   always a signed capture.
+- `src/handoff.rs` — the **Storage hand-off**. With `x-signing-transport:
+  storage-v1` the body is `{source_url, dest_url}`: signed Supabase Storage
+  links (download the input, upload the output) for two objects in the
+  private `signing-handoff` bucket, instead of the photo. The Lambda
+  downloads, signs as usual, uploads, and answers `{bytes, sha256}` so
+  `sign-photo` can check what it fetches. This exists because a Function URL
+  caps each request and response at 6MB after base64 (~4.5MB of JPEG) and a
+  detailed capture is bigger — it was a `413` before reaching this code.
+  Links must be https on **`HANDOFF_STORAGE_HOST`** (a Lambda env var, the
+  project's host); unset, the hand-off is refused and only photo-in-body
+  requests work. No redirects are followed, and the source is capped at
+  64MB. The Lambda holds no Supabase credentials.
 - `src/watermark.rs` — composites the brand mark, **an image:
   `assets/brand-mark.png`** (embedded with `include_bytes!`), onto the
   decoded capture: width 9% of the shorter side, height from the PNG's own
@@ -130,7 +142,7 @@ comment.
 - IAM role `c2pa-signer-lambda-role` — inline policy `SignAndReadCertChain`
   (`kms:Sign` scoped to the key above, `ssm:GetParameter` scoped to the
   cert-chain parameter) plus the managed `AWSLambdaBasicExecutionRole`
-- Lambda function `c2pa-signer` — arm64, 768MB, 10s timeout, image from ECR
+- Lambda function `c2pa-signer` — arm64, 768MB, 30s timeout (raised from 10s for the Storage hand-off's download and upload), env `KMS_KEY_ID` and `HANDOFF_STORAGE_HOST`, image from ECR
   repo `human-internet-signing-lambda`
 - Function URL (`AWS_IAM` auth) — invoked by IAM user `c2pa-signer-invoker`
   (scoped to `lambda:InvokeFunctionUrl` on this function only; its access

@@ -40,6 +40,17 @@
 // legacy path every build predating this still uses, sending bytes it
 // watermarked itself.
 //
+// **Storage hand-off.** Photos reach the Lambda as short-lived signed links,
+// not request bodies: a Function URL caps each request and response at 6MB
+// after base64 (~4.5MB of JPEG), and a detailed capture is bigger — it was
+// refused with a 413 before reaching the Lambda, on every retry. Each call
+// puts the input in the private `signing-handoff` bucket, sends the Lambda a
+// download link for it and an upload link for the output, then fetches the
+// output, checks its SHA-256, and deletes both. See `invokeLambda`, and
+// aws-signing-lambda/src/handoff.rs. Requires the bucket
+// (supabase/sql/2026-10-10_signing_handoff.sql) and a Lambda that has
+// HANDOFF_STORAGE_HOST set.
+//
 // Required secrets (`supabase secrets set`): SIGNING_LAMBDA_URL,
 // AWS_REGION, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY. Until those are
 // set this function 500s. Optional: PLAY_INTEGRITY_SERVICE_ACCOUNT (a Google
@@ -81,6 +92,19 @@ const CAPTURE_PIPELINE = "server-watermark-v1";
 /// Private bucket holding each signed capture — the ingredient of the photo
 /// that's shared. Owner-readable, written only here with the service role.
 const ORIGINALS_BUCKET = "photo-originals";
+
+/// Private, policy-less bucket the photos pass through on their way to and
+/// from the Lambda — see "Storage hand-off" above.
+const HANDOFF_BUCKET = "signing-handoff";
+
+/// How long the Lambda's links stay valid. Each is used within seconds of
+/// being made; the margin only covers a cold start, and a retry gets new ones.
+const HANDOFF_LINK_SECONDS = 300;
+
+/// Selects the Lambda's storage transport, and is echoed back by a Lambda
+/// that used it. Mirrored in aws-signing-lambda/src/handoff.rs.
+const TRANSPORT_HEADER = "x-signing-transport";
+const STORAGE_TRANSPORT = "storage-v1";
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
@@ -198,56 +222,112 @@ async function signCapturePipeline(
 /// Mirrored in aws-signing-lambda/src/main.rs.
 const LAMBDA_ROUTE_HEADER = "x-signing-route";
 
-/// POSTs `body` to the signing Lambda's `route` — "capture" (sign as-is as a
-/// capture) or "watermark" (watermark a signed capture and sign the result)
-/// — SigV4-signed. Null on a Lambda error, or, with
-/// `requireRouteConfirmation`, on a response that doesn't name `route` in
-/// `x-signing-route`; either is logged.
+/// Has the signing Lambda run `route` — "capture" (sign as-is as a capture)
+/// or "watermark" (watermark a signed capture and sign the result) — on
+/// `body`, and returns the result. The photo goes by the Storage hand-off,
+/// never in the request: `body` is put in `signing-handoff`, and the Lambda is
+/// POSTed (SigV4-signed) a download link for it and an upload link for its
+/// output, which is then fetched and checked against the SHA-256 the Lambda
+/// reports. Both objects are deleted whatever happens.
+///
+/// Null on a Lambda error, a result that doesn't match, or, with
+/// `requireRouteConfirmation`, a response that doesn't name `route` in
+/// `x-signing-route`; each is logged.
 async function invokeLambda(
   route: "capture" | "watermark",
   body: ArrayBuffer,
   { requireRouteConfirmation = false } = {},
 ): Promise<ArrayBuffer | null> {
-  const base = new URL(LAMBDA_FUNCTION_URL);
-  const url = new URL(base.pathname.replace(/\/*$/, "/") + route, base);
-  const signedRequest = await signer.sign(
-    new HttpRequest({
-      method: "POST",
-      protocol: url.protocol,
-      hostname: url.hostname,
-      path: url.pathname,
-      headers: {
-        host: url.hostname,
-        "content-type": "application/octet-stream",
-      },
-      body,
-    }),
-  );
+  const handoff = supabaseAdmin.storage.from(HANDOFF_BUCKET);
+  const callID = crypto.randomUUID();
+  const inputPath = `${callID}/${route}-in.jpg`;
+  const outputPath = `${callID}/${route}-out.jpg`;
 
-  const lambdaResponse = await fetch(url, {
-    method: signedRequest.method,
-    headers: signedRequest.headers,
-    body,
-  });
-  if (!lambdaResponse.ok) {
-    console.error(
-      "Signing Lambda returned",
-      lambdaResponse.status,
-      "for route",
-      route,
-      await lambdaResponse.text(),
+  try {
+    const { error: putError } = await handoff.upload(inputPath, body, {
+      contentType: "image/jpeg",
+    });
+    if (putError) throw putError;
+
+    const { data: source, error: sourceError } = await handoff.createSignedUrl(
+      inputPath,
+      HANDOFF_LINK_SECONDS,
     );
-    return null;
-  }
-  const ranRoute = lambdaResponse.headers.get(LAMBDA_ROUTE_HEADER);
-  if (requireRouteConfirmation && ranRoute !== route) {
-    console.error(
-      `Signing Lambda answered /${route} without confirming it ran it`,
-      `(${LAMBDA_ROUTE_HEADER}: ${ranRoute ?? "absent"}) — is the deployed Lambda older than its routes?`,
+    if (sourceError || !source) throw sourceError ?? new Error("no source link");
+    // Upload links last two hours on Supabase's side and can't be shortened;
+    // this one is good for exactly one object, which is deleted below.
+    const { data: dest, error: destError } = await handoff.createSignedUploadUrl(outputPath);
+    if (destError || !dest) throw destError ?? new Error("no upload link");
+
+    const requestBody = JSON.stringify({ source_url: source.signedUrl, dest_url: dest.signedUrl });
+    const base = new URL(LAMBDA_FUNCTION_URL);
+    const url = new URL(base.pathname.replace(/\/*$/, "/") + route, base);
+    const signedRequest = await signer.sign(
+      new HttpRequest({
+        method: "POST",
+        protocol: url.protocol,
+        hostname: url.hostname,
+        path: url.pathname,
+        headers: {
+          host: url.hostname,
+          "content-type": "application/json",
+          [TRANSPORT_HEADER]: STORAGE_TRANSPORT,
+        },
+        body: requestBody,
+      }),
     );
-    return null;
+
+    const lambdaResponse = await fetch(url, {
+      method: signedRequest.method,
+      headers: signedRequest.headers,
+      body: requestBody,
+    });
+    if (!lambdaResponse.ok) {
+      console.error(
+        "Signing Lambda returned",
+        lambdaResponse.status,
+        "for route",
+        route,
+        await lambdaResponse.text(),
+      );
+      return null;
+    }
+    const ranRoute = lambdaResponse.headers.get(LAMBDA_ROUTE_HEADER);
+    if (requireRouteConfirmation && ranRoute !== route) {
+      console.error(
+        `Signing Lambda answered /${route} without confirming it ran it`,
+        `(${LAMBDA_ROUTE_HEADER}: ${ranRoute ?? "absent"}) — is the deployed Lambda older than its routes?`,
+      );
+      return null;
+    }
+    // A Lambda that predates the hand-off would have treated the JSON as the
+    // photo and failed; one that answers without this header didn't use it.
+    if (lambdaResponse.headers.get(TRANSPORT_HEADER) !== STORAGE_TRANSPORT) {
+      console.error(`Signing Lambda answered /${route} without using the storage hand-off`);
+      return null;
+    }
+    const reported = await lambdaResponse.json() as { bytes?: number; sha256?: string };
+
+    const { data: output, error: getError } = await handoff.download(outputPath);
+    if (getError || !output) throw getError ?? new Error("no output object");
+    const result = await output.arrayBuffer();
+    const digest = toHex(await crypto.subtle.digest("SHA-256", result));
+    if (result.byteLength !== reported.bytes || digest !== reported.sha256) {
+      console.error(
+        `Signing Lambda's /${route} output doesn't match what it reported`,
+        { reported, got: { bytes: result.byteLength, sha256: digest } },
+      );
+      return null;
+    }
+    return result;
+  } finally {
+    const { error: cleanupError } = await handoff.remove([inputPath, outputPath]);
+    if (cleanupError) console.error("Couldn't clean up the signing hand-off", callID, cleanupError);
   }
-  return await lambdaResponse.arrayBuffer();
+}
+
+function toHex(buffer: ArrayBuffer): string {
+  return Array.from(new Uint8Array(buffer), (b) => b.toString(16).padStart(2, "0")).join("");
 }
 
 function signingFailed(): Response {
