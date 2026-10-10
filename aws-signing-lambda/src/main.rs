@@ -1,3 +1,4 @@
+mod handoff;
 mod kms_signer;
 mod manifest;
 mod watermark;
@@ -31,9 +32,11 @@ const CERT_CHAIN_PARAM: &str = "/c2pa/cert-chain";
 /// routing (it ignored the path and signed everything as a capture — which
 /// for `/watermark` would hand back an unwatermarked photo).
 ///
-/// Two calls rather than one returning both images: a Function URL response
-/// is capped at 6MB (base64-encoded), which one full-resolution JPEG
-/// already comes close to.
+/// Two calls rather than one returning both images, and — with
+/// `x-signing-transport: storage-v1` — the photos passed as short-lived
+/// Storage links rather than in the request and response, because a Function
+/// URL caps both at 6MB after base64 and a detailed capture is bigger. See
+/// `handoff.rs`. Without that header the body is the photo, as before.
 #[tokio::main]
 async fn main() -> Result<(), Error> {
     tracing_subscriber::fmt().json().init();
@@ -68,7 +71,7 @@ async fn handle(
     key_id: String,
     cert_chain_pem: String,
 ) -> Result<Response<Body>, Error> {
-    let image_data = match req.body() {
+    let body = match req.body() {
         Body::Binary(bytes) => bytes.clone(),
         Body::Text(text) => text.clone().into_bytes(),
         Body::Empty => Vec::new(),
@@ -76,7 +79,7 @@ async fn handle(
         _ => Vec::new(),
     };
 
-    if image_data.is_empty() {
+    if body.is_empty() {
         return Ok(Response::builder()
             .status(400)
             .body(Body::Text("Missing image data".into()))?);
@@ -88,23 +91,62 @@ async fn handle(
             .body(Body::Text(format!("No route {}", req.uri().path())))?);
     };
 
+    let uses_storage = req
+        .headers()
+        .get(handoff::TRANSPORT_HEADER)
+        .is_some_and(|v| v.as_bytes() == handoff::STORAGE_TRANSPORT.as_bytes());
+    if !uses_storage {
+        let signed = sign(route, body, kms_client, key_id, cert_chain_pem).await?;
+        return Ok(Response::builder()
+            .status(200)
+            .header("content-type", "image/jpeg")
+            .header(ROUTE_HEADER, route.name())
+            .body(Body::Binary(signed))?);
+    }
+
+    // The body is a pair of signed Storage links, not the photo.
+    let allowed_host = std::env::var(handoff::ALLOWED_HOST_ENV).ok();
+    let request = match handoff::HandoffRequest::parse(&body, allowed_host.as_deref()) {
+        Ok(request) => request,
+        Err(error) => {
+            tracing::warn!(error = %format!("{error:#}"), "refused a storage hand-off");
+            return Ok(Response::builder()
+                .status(400)
+                .body(Body::Text(format!("{error:#}")))?);
+        }
+    };
+    let client = handoff::client()?;
+    let image_data = handoff::fetch_source(&client, &request.source_url).await?;
+    let signed = sign(route, image_data, kms_client, key_id, cert_chain_pem).await?;
+    let stored = handoff::store_result(&client, &request.dest_url, signed).await?;
+
+    Ok(Response::builder()
+        .status(200)
+        .header("content-type", "application/json")
+        .header(ROUTE_HEADER, route.name())
+        .header(handoff::TRANSPORT_HEADER, handoff::STORAGE_TRANSPORT)
+        .body(Body::Text(serde_json::to_string(&stored)?))?)
+}
+
+/// The signing itself, whichever transport the photo came by.
+async fn sign(
+    route: Route,
+    image_data: Vec<u8>,
+    kms_client: KmsClient,
+    key_id: String,
+    cert_chain_pem: String,
+) -> Result<Vec<u8>, Error> {
     // c2pa-rs's Builder is synchronous, and KmsSigner blocks its own
     // thread waiting on KMS — both wrong to run directly on an async task,
     // so this whole call is pushed onto Tokio's blocking thread pool.
-    let signed = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<u8>> {
+    Ok(tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<u8>> {
         let signer = KmsSigner::new(kms_client, key_id, &cert_chain_pem)?;
         match route {
             Route::Capture => Ok(manifest::sign_capture(&image_data, &signer)?),
             Route::Watermark => manifest::sign_watermarked(&image_data, &signer),
         }
     })
-    .await??;
-
-    Ok(Response::builder()
-        .status(200)
-        .header("content-type", "image/jpeg")
-        .header(ROUTE_HEADER, route.name())
-        .body(Body::Binary(signed))?)
+    .await??)
 }
 
 /// Response header naming the route that ran. Mirrored in `sign-photo`.
