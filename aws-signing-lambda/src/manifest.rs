@@ -10,6 +10,10 @@ const DIGITAL_CAPTURE_URI: &str = "http://cv.iptc.org/newscodes/digitalsourcetyp
 /// ingredient (the signed capture) inside the manifest definition.
 const CAPTURE_INGREDIENT_LABEL: &str = "capture";
 
+/// Label tying the `c2pa.placed` action to the brand-mark ingredient — the
+/// artwork placed into the capture's pixels.
+const BRAND_MARK_INGREDIENT_LABEL: &str = "brand-mark";
+
 /// The capture's manifest: `c2pa.created` + `digitalCapture` — "a real
 /// camera took this", the claim the whole product rests on.
 ///
@@ -44,7 +48,8 @@ fn capture_manifest_json() -> String {
 }
 
 /// The shared photo's manifest: opened from the signed capture (its parent
-/// ingredient), then edited — the brand mark burned in, by this Lambda.
+/// ingredient), then the brand mark placed into it (a component ingredient)
+/// by this Lambda.
 /// The capture's own `c2pa.created`/`digitalCapture` claim travels inside
 /// the ingredient, so a C2PA reader shows the whole chain.
 fn watermarked_manifest_json() -> String {
@@ -66,7 +71,8 @@ fn watermarked_manifest_json() -> String {
             "parameters": {{ "ingredientIds": ["{CAPTURE_INGREDIENT_LABEL}"] }}
           }},
           {{
-            "action": "c2pa.edited",
+            "action": "c2pa.placed",
+            "parameters": {{ "ingredientIds": ["{BRAND_MARK_INGREDIENT_LABEL}"] }},
             "description": "The Human Internet brand mark burned into the top-trailing corner"
           }}
         ]
@@ -96,7 +102,8 @@ pub fn sign_capture(image_data: &[u8], signer: &dyn Signer) -> C2paResult<Vec<u8
 
 /// Step two of the capture pipeline (`/watermark`): takes a capture
 /// *already signed* by `sign_capture`, burns the brand mark in, and signs the result with the
-/// signed capture as its parent ingredient. Returns the watermarked JPEG.
+/// signed capture as its parent ingredient and the brand-mark artwork as a
+/// component ingredient. Returns the watermarked JPEG.
 ///
 /// Refuses input with no C2PA manifest, so the ingredient is always a signed
 /// capture rather than bare pixels — this route only ever sees what
@@ -116,6 +123,13 @@ pub fn sign_watermarked(signed_capture: &[u8], signer: &dyn Signer) -> anyhow::R
         ),
         "image/jpeg",
         &mut Cursor::new(signed_capture),
+    )?;
+    builder.add_ingredient_from_stream(
+        format!(
+            r#"{{ "title": "the-human-internet-brand-mark.png", "relationship": "componentOf", "label": "{BRAND_MARK_INGREDIENT_LABEL}" }}"#
+        ),
+        "image/png",
+        &mut Cursor::new(watermark::BRAND_MARK_PNG),
     )?;
 
     let mut source = Cursor::new(watermarked);
@@ -251,11 +265,18 @@ mod tests {
         let manifest = active_manifest(&report);
         let photo_actions = actions(manifest);
         let names: Vec<&str> = photo_actions.iter().map(|a| a["action"].as_str().unwrap()).collect();
-        assert_eq!(names, ["c2pa.opened", "c2pa.edited"]);
+        assert_eq!(names, ["c2pa.opened", "c2pa.placed"]);
 
         let ingredients = manifest["ingredients"].as_array().unwrap();
-        assert_eq!(ingredients.len(), 1);
+        assert_eq!(ingredients.len(), 2);
         assert_eq!(ingredients[0]["relationship"], "parentOf");
+        assert_eq!(ingredients[1]["relationship"], "componentOf");
+        assert_eq!(ingredients[1]["title"], "the-human-internet-brand-mark.png");
+        // Without an embedded thumbnail a C2PA viewer shows the ingredient
+        // as a blank card — it has no other way to get at the capture's
+        // pixels. Needs c2pa's `add_thumbnails` feature.
+        assert!(ingredients[0]["thumbnail"].is_object(), "{:#}", ingredients[0]);
+        assert!(manifest["thumbnail"].is_object(), "{manifest:#}");
 
         // The ingredient is the signed capture: its own manifest, carried
         // along, still says created + digitalCapture.

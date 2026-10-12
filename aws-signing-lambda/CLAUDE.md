@@ -37,7 +37,7 @@ non-technical process — see the app repo's `CLAUDE.md` Known Gap #1).
   build predating server-side watermarking needs; `POST /watermark` takes a
   capture *already signed by `/capture`*, burns the brand mark in and signs
   the result with that signed capture as its `parentOf` ingredient
-  (`c2pa.opened` → `c2pa.edited`). `sign-photo` calls them in sequence; see
+  (`c2pa.opened` → `c2pa.placed`, the brand-mark PNG as a `componentOf` ingredient). `sign-photo` calls them in sequence; see
   the repo root `CLAUDE.md`. Any other path 404s.
   - **`POST /` is a temporary alias for `/capture`.** The `sign-photo`
     deployed before routing existed POSTs to the Function URL's root, and

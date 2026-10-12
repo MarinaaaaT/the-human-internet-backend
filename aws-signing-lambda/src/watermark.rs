@@ -60,7 +60,7 @@ const FALLBACK_JPEG_QUALITIES: [u8; 6] = [90, 85, 80, 75, 70, 60];
 pub const MAX_WATERMARKED_JPEG_BYTES: usize = 4_000_000;
 
 /// The artwork. Identical to the app's `BrandMarkWatermark` image set.
-const BRAND_MARK_PNG: &[u8] = include_bytes!("../assets/brand-mark.png");
+pub(crate) const BRAND_MARK_PNG: &[u8] = include_bytes!("../assets/brand-mark.png");
 
 /// Returns `jpeg` with the brand mark burned in, re-encoded as a JPEG.
 ///
