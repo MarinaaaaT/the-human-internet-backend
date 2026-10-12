@@ -136,9 +136,8 @@ TAG=$(git rev-parse --short HEAD)
 # Note the current image first — it is the rollback.
 aws lambda get-function --function-name c2pa-signer --query Code.ResolvedImageUri
 
-docker build -t human-internet-signing-lambda:latest .   # arm64; see Building
+docker build -t $REPO:$TAG .   # arm64; see Building
 aws ecr get-login-password | docker login --username AWS --password-stdin ${REPO%%/*}
-docker tag human-internet-signing-lambda:latest $REPO:$TAG
 docker push $REPO:$TAG
 DIGEST=$(aws ecr describe-images --repository-name human-internet-signing-lambda \
   --image-ids imageTag=$TAG --query 'imageDetails[0].imageDigest' --output text)
@@ -153,6 +152,43 @@ what was built and the previous digest is a one-line rollback
 mark. Deploy history: 2026-09-25 `sha256:d572c32…` (server-side
 watermark); 2026-10-10 `sha256:6c22a64…` (fingerprint mark, adaptive
 black/white); 2026-10-11 `sha256:276cf97…` (ingredient thumbnails, `c2pa.placed`). Rollback from that one: `sha256:ad52a1f…`. 2026-10-11 `sha256:eb7a099…` (mark ingredient as drawn, JPEG thumbnail); rollback `sha256:276cf97…`.
+
+**Build straight to `$REPO:$TAG`, never via a `latest` tag.** A failed build
+produces no image but leaves an old `latest` in place, and on 2026-10-11 a
+build that died with `no space left on device` (the log's last lines don't
+make the failure obvious) was followed by tagging and pushing that old
+`latest` — so ECR tag `2363eab` points at the previous image, not that
+commit. Built directly, a failed build leaves no `$REPO:$TAG` and the push
+fails loudly instead. Check the build actually finished before pushing.
+
+### Clean up after every deploy
+
+The Docker VM (`colima`, see Building) has a fixed **30GB** disk, separate
+from the Mac's, and nothing ever deletes old build output: every build
+leaves its multi-GB Rust build stage behind as untagged images, and a
+failed build keeps its half-finished container (~2GB of Rust build files
+each). On 2026-10-11 that reached 30GB — 18 stale images plus three
+failed-build containers up to 8 weeks old — and the build failed.
+
+Run this after the smoke test passes:
+
+```bash
+# Every local build of this Lambda: once pushed, ECR holds its own copy.
+docker images $REPO -q | sort -u | xargs docker rmi -f
+docker images human-internet-signing-lambda -q | sort -u | xargs docker rmi -f   # pre-2026-10-11 local tag
+# Untagged images, stopped containers, dangling build cache.
+docker system prune -f
+docker system df   # should be a few GB
+```
+
+Local Docker is only a build workspace, so this keeps nothing. Rollback
+is `update-function-code` to an old digest, which Lambda pulls from ECR,
+so it works with an empty local Docker. Nothing here touches ECR, which
+keeps every image pushed to it (no lifecycle rule yet). The base images
+(`rust:1-bookworm`, `provided:al2023`) stay, since they're tagged. Pruning
+costs the next build nothing: this Dockerfile doesn't reuse Docker's
+cache between runs anyway. Don't fix a full disk by growing `--disk`;
+that only postpones it.
 
 ## Gotchas already hit and fixed here
 
