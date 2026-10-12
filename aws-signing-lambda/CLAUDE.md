@@ -152,7 +152,7 @@ what was built and the previous digest is a one-line rollback
 `/capture` → `/watermark` as below and check both the manifest and the
 mark. Deploy history: 2026-09-25 `sha256:d572c32…` (server-side
 watermark); 2026-10-10 `sha256:6c22a64…` (fingerprint mark, adaptive
-black/white).
+black/white); 2026-10-11 `sha256:276cf97…` (ingredient thumbnails, `c2pa.placed`). Rollback from that one: `sha256:ad52a1f…`.
 
 ## Gotchas already hit and fixed here
 
