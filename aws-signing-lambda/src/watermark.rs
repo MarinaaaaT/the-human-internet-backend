@@ -73,11 +73,10 @@ pub struct Watermarked {
     /// pictures the mark this photo actually got — not the source artwork,
     /// which is black at 1024px whatever colour was drawn.
     pub mark_png: Vec<u8>,
-    /// [`Self::mark_png`]'s thumbnail: the same mark, same colour, as an
-    /// opaque JPEG on the opposite colour. Supplied rather than generated,
-    /// because a viewer showed c2pa's auto-generated transparent-PNG
-    /// thumbnail as a blank card — and a white mark on a light card would
-    /// vanish anyway.
+    /// [`Self::mark_png`]'s thumbnail, for its own manifest: the same mark,
+    /// same colour, as an opaque JPEG on the opposite colour. Supplied rather
+    /// than generated — c2pa would make a transparent PNG, and a white mark
+    /// on a light card would vanish.
     pub mark_thumbnail_jpeg: Vec<u8>,
 }
 
