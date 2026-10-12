@@ -11,7 +11,7 @@ tracing-subscriber = { version = "0.3", features = ["json"] }
 aws-config = "1"
 aws-sdk-kms = "1"
 aws-sdk-ssm = "1"
-c2pa = "0.90"
+c2pa = { version = "0.90", features = ["add_thumbnails"] }
 p256 = "0.13"
 sha2 = "0.10"
 base64 = "0.22"
