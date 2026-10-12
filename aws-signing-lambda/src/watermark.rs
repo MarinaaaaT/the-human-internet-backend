@@ -31,8 +31,9 @@
 
 use anyhow::{Context, Result};
 use image::{
-    codecs::jpeg::JpegEncoder, imageops, DynamicImage, ExtendedColorType, ImageDecoder,
-    ImageEncoder, ImageReader, Rgba32FImage, RgbImage,
+    codecs::{jpeg::JpegEncoder, png::PngEncoder},
+    imageops, DynamicImage, ExtendedColorType, ImageDecoder, ImageEncoder, ImageReader,
+    Rgba32FImage, RgbImage, RgbaImage,
 };
 use std::io::Cursor;
 use std::sync::OnceLock;
@@ -60,16 +61,40 @@ const FALLBACK_JPEG_QUALITIES: [u8; 6] = [90, 85, 80, 75, 70, 60];
 pub const MAX_WATERMARKED_JPEG_BYTES: usize = 4_000_000;
 
 /// The artwork. Identical to the app's `BrandMarkWatermark` image set.
-pub(crate) const BRAND_MARK_PNG: &[u8] = include_bytes!("../assets/brand-mark.png");
+const BRAND_MARK_PNG: &[u8] = include_bytes!("../assets/brand-mark.png");
 
-/// Returns `jpeg` with the brand mark burned in, re-encoded as a JPEG.
+/// A watermarked photo, plus the mark exactly as it was placed in it.
+pub struct Watermarked {
+    /// The photo with the mark burned in.
+    pub jpeg: Vec<u8>,
+    /// The mark on its own: a transparent PNG at the size it was drawn,
+    /// filled with the colour [`mark_color`] chose for this photo. It is the
+    /// manifest's `c2pa.placed` ingredient, so a Content Credentials viewer
+    /// pictures the mark this photo actually got — not the source artwork,
+    /// which is black at 1024px whatever colour was drawn.
+    pub mark_png: Vec<u8>,
+    /// [`Self::mark_png`]'s thumbnail: the same mark, same colour, as an
+    /// opaque JPEG on the opposite colour. Supplied rather than generated,
+    /// because a viewer showed c2pa's auto-generated transparent-PNG
+    /// thumbnail as a blank card — and a white mark on a light card would
+    /// vanish anyway.
+    pub mark_thumbnail_jpeg: Vec<u8>,
+}
+
+/// Longest edge of [`Watermarked::mark_thumbnail_jpeg`], and how much of it
+/// the mark fills.
+const MARK_THUMBNAIL_SIZE: u32 = 512;
+const MARK_THUMBNAIL_FILL: f32 = 0.7;
+
+/// Returns `jpeg` with the brand mark burned in, re-encoded as a JPEG, along
+/// with the mark as drawn.
 ///
 /// EXIF orientation is applied to the pixels (a raw iPhone capture is almost
 /// always stored sideways and tagged), so the mark lands in the corner a
 /// viewer sees and the output needs no orientation tag — the same thing
 /// UIKit's redraw did on device. The ICC profile is carried over; other
 /// metadata (EXIF, GPS) is dropped, as it was on device.
-pub fn watermark_jpeg(jpeg: &[u8]) -> Result<Vec<u8>> {
+pub fn watermark_jpeg(jpeg: &[u8]) -> Result<Watermarked> {
     let mut decoder = ImageReader::new(Cursor::new(jpeg))
         .with_guessed_format()?
         .into_decoder()
@@ -86,9 +111,30 @@ pub fn watermark_jpeg(jpeg: &[u8]) -> Result<Vec<u8>> {
     let is_display_p3 = icc_profile
         .as_deref()
         .is_some_and(|icc| contains(icc, b"Display P3") || contains(icc, &utf16be("Display P3")));
-    draw_mark(&mut rgb, is_display_p3)?;
+    let (mark_png, color) = draw_mark(&mut rgb, is_display_p3)?;
 
-    encode_within(&rgb, icc_profile.as_deref(), MAX_WATERMARKED_JPEG_BYTES)
+    Ok(Watermarked {
+        jpeg: encode_within(&rgb, icc_profile.as_deref(), MAX_WATERMARKED_JPEG_BYTES)?,
+        mark_png,
+        mark_thumbnail_jpeg: mark_thumbnail(color)?,
+    })
+}
+
+/// See [`Watermarked::mark_thumbnail_jpeg`].
+fn mark_thumbnail(color: MarkColor) -> Result<Vec<u8>> {
+    let background = match color {
+        MarkColor::Black => MarkColor::White,
+        MarkColor::White => MarkColor::Black,
+    };
+    let side = MARK_THUMBNAIL_SIZE;
+    let fill = image::Rgb(background.rgb().map(|v| (v * 255.0) as u8));
+    let mut canvas = RgbImage::from_pixel(side, side, fill);
+    let aspect = mark_aspect_ratio()?;
+    let width = side as f32 * MARK_THUMBNAIL_FILL / aspect.max(1.0);
+    let height = width * aspect;
+    let (x, y) = ((side as f32 - width) / 2.0, (side as f32 - height) / 2.0);
+    composite(&mut canvas, x, y, width, height, color.rgb())?;
+    encode(&canvas, None, JPEG_QUALITY)
 }
 
 /// Encodes at [`JPEG_QUALITY`], stepping down through
@@ -185,16 +231,36 @@ pub fn mark_aspect_ratio() -> Result<f32> {
     Ok(mark.height() as f32 / mark.width() as f32)
 }
 
-fn draw_mark(image: &mut RgbImage, to_display_p3: bool) -> Result<()> {
+/// Draws the mark into `image` and returns it on its own as a PNG — see
+/// [`Watermarked::mark_png`] — along with the colour it was filled with.
+fn draw_mark(image: &mut RgbImage, to_display_p3: bool) -> Result<(Vec<u8>, MarkColor)> {
     let (x, y, width) = mark_placement(image.width(), image.height());
     let height = width * mark_aspect_ratio()?;
     // Decided before anything is drawn, from the photo alone.
-    let mut color = mark_color(image, x, y, width, height).rgb();
+    let chosen = mark_color(image, x, y, width, height);
+    let mut color = chosen.rgb();
     if to_display_p3 {
         // A no-op for pure black and white, which are the same in both
         // spaces; kept so any future fill colour stays colour-managed.
         color = srgb_to_display_p3(color);
     }
+    let scaled = composite(image, x, y, width, height, color)?;
+
+    // The standalone PNG carries no ICC profile, so it's sRGB: the
+    // pre-conversion colour (identical for black and white anyway).
+    let to_u8 = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+    let [r, g, b] = chosen.rgb().map(to_u8);
+    let mark = RgbaImage::from_fn(scaled.width(), scaled.height(), |mx, my| {
+        image::Rgba([r, g, b, to_u8(scaled.get_pixel(mx, my).0[3])])
+    });
+    let mut png = Vec::new();
+    PngEncoder::new(&mut png).write_image(mark.as_raw(), mark.width(), mark.height(), ExtendedColorType::Rgba8)?;
+    Ok((png, chosen))
+}
+
+/// Blends the artwork, filled with `color`, into `image` at `(x, y)` sized
+/// `width`×`height`. Returns the resized artwork (its alpha is the shape).
+fn composite(image: &mut RgbImage, x: f32, y: f32, width: f32, height: f32, color: [f32; 3]) -> Result<Rgba32FImage> {
     let scaled = imageops::resize(
         brand_mark()?,
         width.round().max(1.0) as u32,
@@ -219,7 +285,7 @@ fn draw_mark(image: &mut RgbImage, to_display_p3: bool) -> Result<()> {
             *d = (blended * 255.0).round().clamp(0.0, 255.0) as u8;
         }
     }
-    Ok(())
+    Ok(scaled)
 }
 
 /// Re-expresses a gamma-encoded sRGB colour in Display P3 (same primaries'
@@ -292,7 +358,7 @@ mod tests {
 
     #[test]
     fn mark_lands_top_trailing_and_nowhere_else() {
-        let out = decode(&watermark_jpeg(&gray_jpeg(1000, 800)).unwrap());
+        let out = decode(&watermark_jpeg(&gray_jpeg(1000, 800)).unwrap().jpeg);
         assert_eq!(out.dimensions(), (1000, 800));
 
         let (x, y, size) = mark_placement(1000, 800);
@@ -310,9 +376,9 @@ mod tests {
     fn the_mark_is_black_on_a_light_photo_and_white_on_a_dark_one() {
         let (x, y, size) = mark_placement(1000, 800);
         let aspect = mark_aspect_ratio().unwrap();
-        let light = decode(&watermark_jpeg(&solid_jpeg(1000, 800, 230)).unwrap());
+        let light = decode(&watermark_jpeg(&solid_jpeg(1000, 800, 230)).unwrap().jpeg);
         assert!(is_black(&at(&light, x, y, size, aspect, ON_STROKE)));
-        let dark = decode(&watermark_jpeg(&solid_jpeg(1000, 800, 25)).unwrap());
+        let dark = decode(&watermark_jpeg(&solid_jpeg(1000, 800, 25)).unwrap().jpeg);
         assert!(is_white(&at(&dark, x, y, size, aspect, ON_STROKE)));
     }
 
@@ -357,7 +423,7 @@ mod tests {
     fn exif_orientation_is_applied_before_placing_the_mark() {
         let landscape = gray_jpeg(1200, 900);
         let tagged = with_exif_orientation(&landscape, 6);
-        let out = decode(&watermark_jpeg(&tagged).unwrap());
+        let out = decode(&watermark_jpeg(&tagged).unwrap().jpeg);
         assert_eq!(out.dimensions(), (900, 1200), "output should be the upright portrait");
 
         let (x, y, size) = mark_placement(900, 1200);
@@ -428,6 +494,40 @@ mod tests {
     fn the_cap_fits_the_function_url_limit_with_room_for_the_manifest() {
         let with_manifest = MAX_WATERMARKED_JPEG_BYTES + 300_000;
         assert!(with_manifest.div_ceil(3) * 4 < 6 * 1024 * 1024);
+    }
+
+    /// The standalone mark is what was drawn: the placed size, and the
+    /// chosen colour — white over a dark photo, black over a light one.
+    #[test]
+    fn the_mark_png_is_the_mark_as_drawn() {
+        let (_, _, size) = mark_placement(1000, 800);
+        let aspect = mark_aspect_ratio().unwrap();
+        for (level, expected) in [(25u8, 255u8), (230, 0)] {
+            let png = watermark_jpeg(&solid_jpeg(1000, 800, level)).unwrap().mark_png;
+            let mark = image::load_from_memory(&png).unwrap().into_rgba8();
+            assert_eq!(mark.width(), size.round() as u32);
+            let on = mark.get_pixel((size * ON_STROKE.0) as u32, (size * aspect * ON_STROKE.1) as u32);
+            assert_eq!(on.0, [expected, expected, expected, 255], "level {level}");
+            let off = mark.get_pixel((size * OFF_STROKE.0) as u32, (size * aspect * OFF_STROKE.1) as u32);
+            assert!(off.0[3] < 8, "level {level}: {off:?}"); // Lanczos ringing
+        }
+    }
+
+    /// The thumbnail shows the drawn colour on the opposite one.
+    #[test]
+    fn the_mark_thumbnail_is_the_drawn_colour_on_its_opposite() {
+        let aspect = mark_aspect_ratio().unwrap();
+        let side = MARK_THUMBNAIL_SIZE as f32;
+        let w = side * MARK_THUMBNAIL_FILL / aspect.max(1.0);
+        let (x, y) = ((side - w) / 2.0, (side - w * aspect) / 2.0);
+        for (level, mark, background) in [(25u8, 255u8, 0u8), (230, 0, 255)] {
+            let thumb = decode(&watermark_jpeg(&solid_jpeg(1000, 800, level)).unwrap().mark_thumbnail_jpeg);
+            assert_eq!(thumb.dimensions(), (MARK_THUMBNAIL_SIZE, MARK_THUMBNAIL_SIZE));
+            let corner = thumb.get_pixel(2, 2).0;
+            assert!(corner.iter().all(|&c| c.abs_diff(background) < 20), "level {level}: {corner:?}");
+            let on = at(&thumb, x, y, w, aspect, ON_STROKE).0;
+            assert!(on.iter().all(|&c| c.abs_diff(mark) < 20), "level {level}: {on:?}");
+        }
     }
 
     #[test]

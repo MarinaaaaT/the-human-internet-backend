@@ -11,8 +11,11 @@ const DIGITAL_CAPTURE_URI: &str = "http://cv.iptc.org/newscodes/digitalsourcetyp
 const CAPTURE_INGREDIENT_LABEL: &str = "capture";
 
 /// Label tying the `c2pa.placed` action to the brand-mark ingredient — the
-/// artwork placed into the capture's pixels.
+/// mark as it was placed into the capture's pixels (colour and size).
 const BRAND_MARK_INGREDIENT_LABEL: &str = "brand-mark";
+
+/// Resource id of the brand-mark ingredient's supplied thumbnail.
+const MARK_THUMBNAIL_ID: &str = "brand-mark-thumbnail.jpg";
 
 /// The capture's manifest: `c2pa.created` + `digitalCapture` — "a real
 /// camera took this", the claim the whole product rests on.
@@ -102,8 +105,8 @@ pub fn sign_capture(image_data: &[u8], signer: &dyn Signer) -> C2paResult<Vec<u8
 
 /// Step two of the capture pipeline (`/watermark`): takes a capture
 /// *already signed* by `sign_capture`, burns the brand mark in, and signs the result with the
-/// signed capture as its parent ingredient and the brand-mark artwork as a
-/// component ingredient. Returns the watermarked JPEG.
+/// signed capture as its parent ingredient and the mark as drawn (see
+/// [`watermark::Watermarked::mark_png`]) as a component ingredient. Returns the watermarked JPEG.
 ///
 /// Refuses input with no C2PA manifest, so the ingredient is always a signed
 /// capture rather than bare pixels — this route only ever sees what
@@ -114,7 +117,8 @@ pub fn sign_watermarked(signed_capture: &[u8], signer: &dyn Signer) -> anyhow::R
         .with_stream("image/jpeg", Cursor::new(signed_capture))
         .map_err(|e| anyhow::anyhow!("input is not a signed capture: {e}"))?;
 
-    let watermarked = watermark::watermark_jpeg(signed_capture)?;
+    let watermark::Watermarked { jpeg: watermarked, mark_png, mark_thumbnail_jpeg } =
+        watermark::watermark_jpeg(signed_capture)?;
 
     let mut builder = Builder::default().with_definition(watermarked_manifest_json())?;
     builder.add_ingredient_from_stream(
@@ -124,12 +128,15 @@ pub fn sign_watermarked(signed_capture: &[u8], signer: &dyn Signer) -> anyhow::R
         "image/jpeg",
         &mut Cursor::new(signed_capture),
     )?;
+    // Supplied, so c2pa doesn't generate one — see `mark_thumbnail_jpeg`.
+    builder.add_resource(MARK_THUMBNAIL_ID, Cursor::new(mark_thumbnail_jpeg))?;
     builder.add_ingredient_from_stream(
         format!(
-            r#"{{ "title": "the-human-internet-brand-mark.png", "relationship": "componentOf", "label": "{BRAND_MARK_INGREDIENT_LABEL}" }}"#
+            r#"{{ "title": "the-human-internet-brand-mark.png", "relationship": "componentOf", "label": "{BRAND_MARK_INGREDIENT_LABEL}",
+                "thumbnail": {{ "format": "image/jpeg", "identifier": "{MARK_THUMBNAIL_ID}" }} }}"#
         ),
         "image/png",
-        &mut Cursor::new(watermark::BRAND_MARK_PNG),
+        &mut Cursor::new(mark_png),
     )?;
 
     let mut source = Cursor::new(watermarked);
@@ -272,6 +279,7 @@ mod tests {
         assert_eq!(ingredients[0]["relationship"], "parentOf");
         assert_eq!(ingredients[1]["relationship"], "componentOf");
         assert_eq!(ingredients[1]["title"], "the-human-internet-brand-mark.png");
+        assert_eq!(ingredients[1]["thumbnail"]["format"], "image/jpeg");
         // Without an embedded thumbnail a C2PA viewer shows the ingredient
         // as a blank card — it has no other way to get at the capture's
         // pixels. Needs c2pa's `add_thumbnails` feature.
