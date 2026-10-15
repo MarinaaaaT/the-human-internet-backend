@@ -11,8 +11,8 @@
 //! c2pa-rs can make one itself (its `add_thumbnails` feature): a
 //! `Builder::sign` with no `thumbnail` in its definition decodes the whole
 //! JPEG it's signing, applies EXIF orientation, downscales and re-encodes.
-//! That is ~110ms per 12MP capture on an M1 core and several times that on
-//! the Lambda's fraction of a vCPU, for pixels this Lambda had just decoded
+//! That is ~110ms per 12MP capture on an M1 core and more on the Lambda's
+//! single vCPU, for pixels this Lambda had just decoded
 //! anyway to draw the mark. So every manifest here supplies its thumbnail:
 //! [`from_pixels`] for the original and the photo, built from the decoded
 //! capture; [`from_jpeg_scaled`] for `/capture`, which otherwise never

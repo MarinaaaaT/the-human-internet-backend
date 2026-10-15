@@ -19,7 +19,7 @@ anyhow = "1"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 # `/capture`'s claim thumbnail (src/thumbnail.rs): unlike image's own JPEG
 # decoder (zune-jpeg), this one can decode at 1/2, 1/4 or 1/8 scale. Pure
-# Rust, from the image-rs project; no rayon, which a fraction of a vCPU
+# Rust, from the image-rs project; no rayon, which the Lambda's single vCPU
 # can't use.
 jpeg-decoder = { version = "0.3", default-features = false }
 # The Storage hand-off (src/handoff.rs). Already in the tree via c2pa; rustls,

@@ -132,7 +132,8 @@ non-technical process — see the app repo's `CLAUDE.md` Known Gap #1).
   `add_thumbnails` feature makes one whenever a definition has no
   `thumbnail`: it decodes the whole JPEG being signed, applies orientation,
   downscales and re-encodes (~110ms per 12MP capture on an M1 core, an
-  estimated ~0.5s here). So every manifest now names its own:
+  estimated ~0.5s on the Lambda at its earlier 768MB). So every manifest
+  now names its own:
   - the **original** (`/pipeline`) and the **photo**: made by
     `thumbnail::from_pixels` from the upright pixels already decoded for the
     watermark, the photo's after the mark is composited;
@@ -205,14 +206,14 @@ non-technical process — see the app repo's `CLAUDE.md` Known Gap #1).
 - **Sizing.** `/watermark` decodes, draws and re-encodes a full-resolution
   JPEG; `/pipeline` does that and signs the capture in the same
   invocation, so its duration is roughly `/capture`'s plus `/watermark`'s
-  minus one download and one upload. At the current 768MB / 30s, check a
-  real 12MP capture's duration in CloudWatch after deploying; raising to
-  ~1536MB (Lambda CPU scales with memory) is the likely fix if it's tight.
-  The `timing` logs (`src/timing.rs`) say which step to look at first. On a
-  synthetic 4.5MB 12MP capture on an M1 core, the full-resolution `encode`
-  dominated `/pipeline` once thumbnails stopped decoding: ~150ms per
-  attempt, three attempts for a noise-heavy image that overshoots the 4MB
-  cap at 95 and 90.
+  minus one download and one upload. The function runs at **1769MB / 30s**:
+  one full vCPU (Lambda CPU scales with memory), raised from 768MB, about
+  0.43 vCPU, on 2026-10-14. Check real captures' durations in CloudWatch
+  from there, and the `timing` logs (`src/timing.rs`) for which step to
+  look at first. On a synthetic 4.5MB 12MP capture on an M1 core, the
+  full-resolution `encode` dominated `/pipeline` once thumbnails stopped
+  decoding: ~150ms per attempt, three attempts for a noise-heavy image that
+  overshoots the 4MB cap at 95 and 90.
 
 ## Building
 
