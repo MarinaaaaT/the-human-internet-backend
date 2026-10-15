@@ -85,15 +85,24 @@ pub struct Watermarked {
 const MARK_THUMBNAIL_SIZE: u32 = 512;
 const MARK_THUMBNAIL_FILL: f32 = 0.7;
 
-/// Returns `jpeg` with the brand mark burned in, re-encoded as a JPEG, along
-/// with the mark as drawn.
+/// A capture's pixels, upright, and the ICC profile they're in.
+///
+/// Decoding is its own step, apart from [`watermark`], so that one decode can
+/// serve more than the mark — the thumbnails c2pa currently decodes the
+/// capture again to make (`add_thumbnails`) could be built from these.
+pub struct DecodedCapture {
+    pub rgb: RgbImage,
+    pub icc_profile: Option<Vec<u8>>,
+}
+
+/// Decodes a capture for [`watermark`].
 ///
 /// EXIF orientation is applied to the pixels (a raw iPhone capture is almost
 /// always stored sideways and tagged), so the mark lands in the corner a
 /// viewer sees and the output needs no orientation tag — the same thing
-/// UIKit's redraw did on device. The ICC profile is carried over; other
-/// metadata (EXIF, GPS) is dropped, as it was on device.
-pub fn watermark_jpeg(jpeg: &[u8]) -> Result<Watermarked> {
+/// UIKit's redraw did on device. The ICC profile is kept; other metadata
+/// (EXIF, GPS) is dropped, as it was on device.
+pub fn decode_capture(jpeg: &[u8]) -> Result<DecodedCapture> {
     let mut decoder = ImageReader::new(Cursor::new(jpeg))
         .with_guessed_format()?
         .into_decoder()
@@ -102,7 +111,13 @@ pub fn watermark_jpeg(jpeg: &[u8]) -> Result<Watermarked> {
     let icc_profile = decoder.icc_profile()?;
     let mut image = DynamicImage::from_decoder(decoder)?;
     image.apply_orientation(orientation);
-    let mut rgb = image.into_rgb8();
+    Ok(DecodedCapture { rgb: image.into_rgb8(), icc_profile })
+}
+
+/// Burns the brand mark into `capture` and re-encodes it as a JPEG, carrying
+/// its ICC profile over; returns that along with the mark as drawn.
+pub fn watermark(capture: DecodedCapture) -> Result<Watermarked> {
+    let DecodedCapture { mut rgb, icc_profile } = capture;
 
     // An iPhone capture is tagged Display P3; the artwork is sRGB. Pasting
     // sRGB values straight into P3 pixels would come out visibly more
@@ -319,6 +334,10 @@ fn utf16be(s: &str) -> Vec<u8> {
 mod tests {
     use super::*;
     use image::{GenericImageView, Rgb};
+
+    fn watermark_jpeg(jpeg: &[u8]) -> Result<Watermarked> {
+        watermark(decode_capture(jpeg)?)
+    }
 
     fn gray_jpeg(width: u32, height: u32) -> Vec<u8> {
         solid_jpeg(width, height, 40)
