@@ -256,8 +256,15 @@ that only postpones it.
 - IAM role `c2pa-signer-lambda-role` — inline policy `SignAndReadCertChain`
   (`kms:Sign` scoped to the key above, `ssm:GetParameter` scoped to the
   cert-chain parameter) plus the managed `AWSLambdaBasicExecutionRole`
-- Lambda function `c2pa-signer` — arm64, 768MB, 30s timeout (raised from 10s for the Storage hand-off's download and upload), env `KMS_KEY_ID` and `HANDOFF_STORAGE_HOST`, image from ECR
-  repo `human-internet-signing-lambda`
+- Lambda function `c2pa-signer` — arm64, 1769MB, 30s timeout (raised from 10s for the Storage hand-off's download and upload), env `KMS_KEY_ID` and `HANDOFF_STORAGE_HOST`, image from ECR
+  repo `human-internet-signing-lambda`. Memory was raised from 768MB on
+  2026-10-14 for CPU, not memory: peak use is ~200MB, but Lambda allots CPU
+  in proportion to memory and 1769MB is one full vCPU (768MB was ~0.43), and
+  decoding, watermarking and encoding a photo is single-threaded CPU work.
+  Billing is memory × duration, so the shorter runs offset most of the
+  higher rate (estimated ~$0.05 per 1,000 photos, and within the free
+  allowance below ~100k photos a month). Rollback: `aws lambda
+  update-function-configuration --function-name c2pa-signer --memory-size 768`.
 - Function URL (`AWS_IAM` auth) — invoked by IAM user `c2pa-signer-invoker`
   (scoped to `lambda:InvokeFunctionUrl` on this function only; its access
   key lives in the app repo's Supabase project secrets, never here)
