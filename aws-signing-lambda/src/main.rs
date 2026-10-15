@@ -19,9 +19,13 @@ const CERT_CHAIN_PARAM: &str = "/c2pa/cert-chain";
 /// supabase/functions/sign-photo/index.ts), using a KMS-held key that never
 /// leaves AWS. See aws-signing-lambda/README.md for provisioning.
 ///
-/// Two routes (see `Route`):
+/// Three routes (see `Route`):
+/// - `POST /pipeline` — the whole capture pipeline in one call: sign the raw
+///   capture as a `digitalCapture` (the original), then burn the brand mark
+///   into it and sign that with the original as its parent ingredient (the
+///   photo). Returns both, so only with the Storage hand-off.
 /// - `POST /capture` — sign the body as-is as a `digitalCapture`. Step one
-///   of the capture pipeline, and all a request from a build predating
+///   of the two-call pipeline, and all a request from a build predating
 ///   server-side watermarking ever needs.
 /// - `POST /watermark` — step two: the body must be a capture already
 ///   signed by `/capture`; returns it with the brand mark burned in, signed
@@ -32,11 +36,11 @@ const CERT_CHAIN_PARAM: &str = "/c2pa/cert-chain";
 /// routing (it ignored the path and signed everything as a capture — which
 /// for `/watermark` would hand back an unwatermarked photo).
 ///
-/// Two calls rather than one returning both images, and — with
-/// `x-signing-transport: storage-v1` — the photos passed as short-lived
-/// Storage links rather than in the request and response, because a Function
-/// URL caps both at 6MB after base64 and a detailed capture is bigger. See
-/// `handoff.rs`. Without that header the body is the photo, as before.
+/// With `x-signing-transport: storage-v1` the photos are passed as
+/// short-lived Storage links rather than in the request and response,
+/// because a Function URL caps both at 6MB after base64 and a detailed
+/// capture is bigger. See `handoff.rs`. Without that header the body is the
+/// photo, as before.
 #[tokio::main]
 async fn main() -> Result<(), Error> {
     tracing_subscriber::fmt().json().init();
@@ -55,22 +59,16 @@ async fn main() -> Result<(), Error> {
         .parameter
         .and_then(|p| p.value)
         .expect("SSM parameter had no value");
+    let key = SigningKey { kms_client, key_id, cert_chain_pem };
 
     run(service_fn(move |req: Request| {
-        let kms_client = kms_client.clone();
-        let key_id = key_id.clone();
-        let cert_chain_pem = cert_chain_pem.clone();
-        async move { handle(req, kms_client, key_id, cert_chain_pem).await }
+        let key = key.clone();
+        async move { handle(req, key).await }
     }))
     .await
 }
 
-async fn handle(
-    req: Request,
-    kms_client: KmsClient,
-    key_id: String,
-    cert_chain_pem: String,
-) -> Result<Response<Body>, Error> {
+async fn handle(req: Request, key: SigningKey) -> Result<Response<Body>, Error> {
     let body = match req.body() {
         Body::Binary(bytes) => bytes.clone(),
         Body::Text(text) => text.clone().into_bytes(),
@@ -95,8 +93,19 @@ async fn handle(
         .headers()
         .get(handoff::TRANSPORT_HEADER)
         .is_some_and(|v| v.as_bytes() == handoff::STORAGE_TRANSPORT.as_bytes());
+    if route == Route::Pipeline {
+        if !uses_storage {
+            return Ok(Response::builder().status(400).body(Body::Text(format!(
+                "/pipeline returns two photos, which only the storage hand-off can carry \
+                 ({}: {})",
+                handoff::TRANSPORT_HEADER,
+                handoff::STORAGE_TRANSPORT
+            )))?);
+        }
+        return pipeline(&body, key).await;
+    }
     if !uses_storage {
-        let signed = sign(route, body, kms_client, key_id, cert_chain_pem).await?;
+        let signed = sign(route, body, &key).await?;
         return Ok(Response::builder()
             .status(200)
             .header("content-type", "image/jpeg")
@@ -108,45 +117,90 @@ async fn handle(
     let allowed_host = std::env::var(handoff::ALLOWED_HOST_ENV).ok();
     let request = match handoff::HandoffRequest::parse(&body, allowed_host.as_deref()) {
         Ok(request) => request,
-        Err(error) => {
-            tracing::warn!(error = %format!("{error:#}"), "refused a storage hand-off");
-            return Ok(Response::builder()
-                .status(400)
-                .body(Body::Text(format!("{error:#}")))?);
-        }
+        Err(error) => return refuse_handoff(error),
     };
     let client = handoff::client()?;
     let image_data = handoff::fetch_source(&client, &request.source_url).await?;
-    let signed = sign(route, image_data, kms_client, key_id, cert_chain_pem).await?;
+    let signed = sign(route, image_data, &key).await?;
     let stored = handoff::store_result(&client, &request.dest_url, signed).await?;
+    handoff_answer(route, &stored)
+}
 
+/// `/pipeline`: one download, both signatures, two uploads. The original's
+/// upload runs while the photo is being watermarked and signed, so of the two
+/// only the photo's is on the critical path.
+async fn pipeline(body: &[u8], key: SigningKey) -> Result<Response<Body>, Error> {
+    let allowed_host = std::env::var(handoff::ALLOWED_HOST_ENV).ok();
+    let request = match handoff::PipelineRequest::parse(body, allowed_host.as_deref()) {
+        Ok(request) => request,
+        Err(error) => return refuse_handoff(error),
+    };
+    let client = handoff::client()?;
+    let raw_capture = handoff::fetch_source(&client, &request.source_url).await?;
+
+    let original = key.run(move |signer| Ok(manifest::sign_capture(&raw_capture, signer)?)).await?;
+    let watermarking = original.clone();
+    let (original, photo) = tokio::try_join!(
+        handoff::store_result(&client, &request.original_url, original),
+        key.run(move |signer| manifest::watermark_signed_capture(&watermarking, signer)),
+    )?;
+    let photo = handoff::store_result(&client, &request.photo_url, photo).await?;
+
+    handoff_answer(Route::Pipeline, &handoff::PipelineResponse { original, photo })
+}
+
+/// A hand-off body this Lambda won't act on: a 400, logged.
+fn refuse_handoff(error: anyhow::Error) -> Result<Response<Body>, Error> {
+    tracing::warn!(error = %format!("{error:#}"), "refused a storage hand-off");
+    Ok(Response::builder()
+        .status(400)
+        .body(Body::Text(format!("{error:#}")))?)
+}
+
+/// A successful hand-off: the outputs are in Storage, and the answer
+/// describes them.
+fn handoff_answer(route: Route, described: &impl serde::Serialize) -> Result<Response<Body>, Error> {
     Ok(Response::builder()
         .status(200)
         .header("content-type", "application/json")
         .header(ROUTE_HEADER, route.name())
         .header(handoff::TRANSPORT_HEADER, handoff::STORAGE_TRANSPORT)
-        .body(Body::Text(serde_json::to_string(&stored)?))?)
+        .body(Body::Text(serde_json::to_string(described)?))?)
 }
 
-/// The signing itself, whichever transport the photo came by.
-async fn sign(
-    route: Route,
-    image_data: Vec<u8>,
+/// A single-output route's signing, whichever transport the photo came by.
+async fn sign(route: Route, image_data: Vec<u8>, key: &SigningKey) -> anyhow::Result<Vec<u8>> {
+    key.run(move |signer| match route {
+        Route::Capture => Ok(manifest::sign_capture(&image_data, signer)?),
+        Route::Watermark => manifest::sign_watermarked(&image_data, signer),
+        Route::Pipeline => anyhow::bail!("/pipeline has two outputs; see `pipeline`"),
+    })
+    .await
+}
+
+/// What a `KmsSigner` is made from, read once at cold start.
+#[derive(Clone)]
+struct SigningKey {
     kms_client: KmsClient,
     key_id: String,
     cert_chain_pem: String,
-) -> Result<Vec<u8>, Error> {
-    // c2pa-rs's Builder is synchronous, and KmsSigner blocks its own
-    // thread waiting on KMS — both wrong to run directly on an async task,
-    // so this whole call is pushed onto Tokio's blocking thread pool.
-    Ok(tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<u8>> {
-        let signer = KmsSigner::new(kms_client, key_id, &cert_chain_pem)?;
-        match route {
-            Route::Capture => Ok(manifest::sign_capture(&image_data, &signer)?),
-            Route::Watermark => manifest::sign_watermarked(&image_data, &signer),
-        }
-    })
-    .await??)
+}
+
+impl SigningKey {
+    /// Runs `sign` with a signer for this key, on Tokio's blocking thread
+    /// pool: c2pa-rs's Builder is synchronous, and `KmsSigner` blocks its own
+    /// thread waiting on KMS — both wrong to run directly on an async task.
+    async fn run<T: Send + 'static>(
+        &self,
+        sign: impl FnOnce(&KmsSigner) -> anyhow::Result<T> + Send + 'static,
+    ) -> anyhow::Result<T> {
+        let key = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let signer = KmsSigner::new(key.kms_client, key.key_id, &key.cert_chain_pem)?;
+            sign(&signer)
+        })
+        .await?
+    }
 }
 
 /// Response header naming the route that ran. Mirrored in `sign-photo`.
@@ -156,6 +210,7 @@ const ROUTE_HEADER: &str = "x-signing-route";
 enum Route {
     Capture,
     Watermark,
+    Pipeline,
 }
 
 impl Route {
@@ -168,6 +223,7 @@ impl Route {
             // Remove once that `sign-photo` is live — nothing else calls it.
             "" => Some(Route::Capture),
             "/watermark" => Some(Route::Watermark),
+            "/pipeline" => Some(Route::Pipeline),
             _ => None,
         }
     }
@@ -176,6 +232,7 @@ impl Route {
         match self {
             Route::Capture => "capture",
             Route::Watermark => "watermark",
+            Route::Pipeline => "pipeline",
         }
     }
 }
@@ -189,15 +246,19 @@ mod tests {
         assert_eq!(Route::for_path("/capture"), Some(Route::Capture));
         assert_eq!(Route::for_path("/capture/"), Some(Route::Capture));
         assert_eq!(Route::for_path("/watermark"), Some(Route::Watermark));
+        assert_eq!(Route::for_path("/pipeline"), Some(Route::Pipeline));
+        assert_eq!(Route::for_path("/pipeline/"), Some(Route::Pipeline));
         assert_eq!(Route::for_path("/"), Some(Route::Capture), "legacy root alias");
         assert_eq!(Route::for_path(""), Some(Route::Capture), "legacy root alias");
         assert_eq!(Route::for_path("/sign"), None);
         assert_eq!(Route::for_path("/watermark/extra"), None);
+        assert_eq!(Route::for_path("/pipeline/extra"), None);
     }
 
     #[test]
     fn route_header_names_what_ran() {
         assert_eq!(Route::Capture.name(), "capture");
         assert_eq!(Route::Watermark.name(), "watermark");
+        assert_eq!(Route::Pipeline.name(), "pipeline");
     }
 }

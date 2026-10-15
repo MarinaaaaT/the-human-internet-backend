@@ -135,8 +135,9 @@ fn sign_mark(mark_png: &[u8], thumbnail_jpeg: &[u8], signer: &dyn Signer) -> C2p
 }
 
 /// Signs a capture (a JPEG) as-is, as a `digitalCapture`, and returns the
-/// signed JPEG bytes. The `/capture` route: step one of the capture
-/// pipeline, and all a build predating server-side watermarking needs.
+/// signed JPEG bytes. The `/capture` route — step one of the two-call capture
+/// pipeline, and all a build predating server-side watermarking needs — and
+/// the first half of `/pipeline`.
 ///
 /// Blocking — callers on an async runtime should run this via
 /// `spawn_blocking` (see main.rs), both because c2pa-rs's Builder is
@@ -152,10 +153,7 @@ pub fn sign_capture(image_data: &[u8], signer: &dyn Signer) -> C2paResult<Vec<u8
 }
 
 /// Step two of the capture pipeline (`/watermark`): takes a capture
-/// *already signed* by `sign_capture`, burns the brand mark in, and signs the result with the
-/// signed capture as its parent ingredient and the mark as drawn (see
-/// [`watermark::Watermarked::mark_png`]), itself signed, as a component
-/// ingredient. Returns the watermarked JPEG.
+/// *already signed* by `sign_capture` and does [`watermark_signed_capture`].
 ///
 /// Refuses input with no C2PA manifest, so the ingredient is always a signed
 /// capture rather than bare pixels — this route only ever sees what
@@ -165,9 +163,23 @@ pub fn sign_watermarked(signed_capture: &[u8], signer: &dyn Signer) -> anyhow::R
     Reader::default()
         .with_stream("image/jpeg", Cursor::new(signed_capture))
         .map_err(|e| anyhow::anyhow!("input is not a signed capture: {e}"))?;
+    watermark_signed_capture(signed_capture, signer)
+}
 
+/// The watermark step itself: burns the brand mark into a signed capture,
+/// and signs the result with the signed capture as its parent ingredient and
+/// the mark as drawn (see [`watermark::Watermarked::mark_png`]), itself
+/// signed, as a component ingredient. Returns the watermarked JPEG.
+///
+/// `/watermark` gets here through [`sign_watermarked`], which first checks
+/// its input really is a signed capture. `/pipeline` calls this directly, on
+/// what [`sign_capture`] returned a moment earlier in the same invocation:
+/// those bytes never left this Lambda, so reading them back would prove
+/// nothing. Blocking, like `sign_capture`.
+pub fn watermark_signed_capture(signed_capture: &[u8], signer: &dyn Signer) -> anyhow::Result<Vec<u8>> {
+    let capture = watermark::decode_capture(signed_capture)?;
     let watermark::Watermarked { jpeg: watermarked, mark_png, mark_thumbnail_jpeg } =
-        watermark::watermark_jpeg(signed_capture)?;
+        watermark::watermark(capture)?;
 
     let mut builder = Builder::default().with_definition(watermarked_manifest_json())?;
     builder.add_ingredient_from_stream(
@@ -355,6 +367,47 @@ mod tests {
             image::load_from_memory(&watermarked).unwrap().into_rgb8().get_pixel(600, 40),
             image::load_from_memory(&signed_capture).unwrap().into_rgb8().get_pixel(600, 40),
         );
+    }
+
+    /// `/pipeline`: the capture signed, then watermarked straight from memory
+    /// with no re-read in between. Both outputs must be exactly what
+    /// `/capture` and `/watermark` would have made.
+    #[test]
+    fn pipeline_signs_the_original_and_a_photo_descended_from_it() {
+        let signer = test_signer();
+        let original = sign_capture(&capture_jpeg(), signer.as_ref()).unwrap();
+        let photo = watermark_signed_capture(&original, signer.as_ref()).unwrap();
+
+        // The original: a capture, and nothing else.
+        let original_report = read(&original);
+        assert_eq!(unexpected_failures(&original_report), Vec::<String>::new(), "{original_report:#}");
+        let original_actions = actions(active_manifest(&original_report));
+        assert_eq!(original_actions.len(), 1);
+        assert_eq!(original_actions[0]["action"], "c2pa.created");
+        assert_eq!(original_actions[0]["digitalSourceType"], DIGITAL_CAPTURE_URI);
+
+        // The photo: opened from the original, mark placed.
+        let photo_report = read(&photo);
+        assert_eq!(unexpected_failures(&photo_report), Vec::<String>::new(), "{photo_report:#}");
+        let manifest = active_manifest(&photo_report);
+        let names: Vec<String> = actions(manifest)
+            .iter()
+            .map(|a| a["action"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(names, ["c2pa.opened", "c2pa.placed"]);
+        let ingredients = manifest["ingredients"].as_array().unwrap();
+        assert_eq!(ingredients.len(), 2);
+        assert_eq!(ingredients[1]["relationship"], "componentOf");
+
+        // Its parent is this very original: the manifest the ingredient
+        // carries is the one the original was signed with (manifest labels
+        // are unique per signing), and it still says created + digitalCapture.
+        assert_eq!(ingredients[0]["relationship"], "parentOf");
+        let original_label = original_report["active_manifest"].as_str().unwrap();
+        assert_eq!(ingredients[0]["active_manifest"], original_label);
+        let carried_actions = actions(&photo_report["manifests"][original_label]);
+        assert_eq!(carried_actions[0]["action"], "c2pa.created");
+        assert_eq!(carried_actions[0]["digitalSourceType"], DIGITAL_CAPTURE_URI);
     }
 
     #[test]

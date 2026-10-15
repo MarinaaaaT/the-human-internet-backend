@@ -31,22 +31,24 @@
 // Attest's, and why.
 //
 // **Capture pipeline** (`X-Capture-Pipeline: server-watermark-v1` +
-// `X-Photo-Id`): the body is the *raw* capture. It's signed as a capture,
-// the Lambda burns the brand mark into that signed capture and signs the
-// result with it as the parent ingredient (`/capture` then `/watermark`),
-// the signed capture is stored in
-// the private `photo-originals` bucket, and the watermarked photo is returned
-// for the app to upload. Without the header the body is signed as-is — the
-// legacy path every build predating this still uses, sending bytes it
-// watermarked itself.
+// `X-Photo-Id`): the body is the *raw* capture. One Lambda call (`/pipeline`)
+// signs it as a capture (the original), burns the brand mark into that signed
+// capture and signs the result with it as the parent ingredient (the photo).
+// The original is copied into the private `photo-originals` bucket inside
+// Storage, and the photo is returned for the app to upload. A Lambda deployed
+// before `/pipeline` answers it 404, and then the same work is done in two
+// calls, `/capture` then `/watermark`. Without the header the body is signed
+// as-is — the legacy path every build predating this still uses, sending
+// bytes it watermarked itself.
 //
 // **Storage hand-off.** Photos reach the Lambda as short-lived signed links,
 // not request bodies: a Function URL caps each request and response at 6MB
 // after base64 (~4.5MB of JPEG), and a detailed capture is bigger — it was
 // refused with a 413 before reaching the Lambda, on every retry. Each call
 // puts the input in the private `signing-handoff` bucket, sends the Lambda a
-// download link for it and an upload link for the output, then fetches the
-// output, checks its SHA-256, and deletes both. See `invokeLambda`, and
+// download link for it and an upload link for each output, then fetches the
+// output it returns, checks its SHA-256, and deletes them all once the
+// response has gone. See `invokeLambda`, `invokePipeline`, and
 // aws-signing-lambda/src/handoff.rs. Requires the bucket
 // (supabase/sql/2026-10-10_signing_handoff.sql) and a Lambda that has
 // HANDOFF_STORAGE_HOST set.
@@ -70,6 +72,8 @@ import {
 } from "../_shared/playIntegrity.ts";
 
 const LAMBDA_FUNCTION_URL = Deno.env.get("SIGNING_LAMBDA_URL")!;
+const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
+const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 const AWS_REGION = Deno.env.get("AWS_REGION")!;
 
 /// Mirrors FeatureFlagAudience.includes(isAdmin:). A missing row or an
@@ -108,10 +112,7 @@ const STORAGE_TRANSPORT = "storage-v1";
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
-const supabaseAdmin = createClient(
-  Deno.env.get("SUPABASE_URL")!,
-  Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!,
-);
+const supabaseAdmin = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
 const signer = new SignatureV4({
   service: "lambda",
@@ -126,7 +127,7 @@ const signer = new SignatureV4({
 Deno.serve(async (req) => {
   try {
     const supabaseClient = createClient(
-      Deno.env.get("SUPABASE_URL")!,
+      SUPABASE_URL,
       Deno.env.get("SUPABASE_ANON_KEY")!,
       { global: { headers: { Authorization: req.headers.get("Authorization")! } } },
     );
@@ -180,11 +181,14 @@ Deno.serve(async (req) => {
 });
 
 /// The capture pipeline: the body is the raw capture.
-///   1. sign it as-is — `c2pa.created` / `digitalCapture`;
-///   2. have the Lambda burn the brand mark into *that signed capture* and
-///      sign the result with it as the parent ingredient;
-///   3. keep the signed capture in the originals bucket, for photo history;
-///   4. hand back the watermarked photo, which the app uploads as the photo.
+///   1. sign it as-is — `c2pa.created` / `digitalCapture` (the original);
+///   2. burn the brand mark into *that signed capture* and sign the result
+///      with it as the parent ingredient (the photo);
+///   3. keep the original in the originals bucket, for photo history;
+///   4. hand back the photo, which the app uploads as the photo.
+/// One Lambda call does 1 and 2 (`/pipeline`); a Lambda deployed before that
+/// route answers it 404, and then they're done in two (`/capture`,
+/// `/watermark`), as before it existed.
 /// The App Attest assertion (checked before this) is over the raw capture,
 /// so the chain starts at bytes the app itself captured.
 async function signCapturePipeline(
@@ -192,35 +196,163 @@ async function signCapturePipeline(
   userID: string,
   photoID: string,
 ): Promise<Response> {
-  const signedCapture = await invokeLambda("capture", rawCapture);
-  if (!signedCapture) return signingFailed();
+  // Same `{user_id}/{photo_id}.jpg` shape as the photos bucket. Overwritten,
+  // so a retry after a later step failed just replaces the same object.
+  const originalPath = `${userID}/${photoID}.jpg`;
 
-  // `requireRouteConfirmation`: a Lambda that predates routing ignores the
-  // path and would sign this as another capture — no watermark — and the app
-  // would upload it. Only a Lambda that says it ran `watermark` is believed.
-  const watermarked = await invokeLambda("watermark", signedCapture, {
-    requireRouteConfirmation: true,
-  });
+  let watermarked = await invokePipeline(rawCapture, originalPath);
+  if (watermarked === NO_PIPELINE_ROUTE) {
+    console.warn("Signing Lambda has no /pipeline route yet; signing in two calls");
+    watermarked = await signInTwoCalls(rawCapture, originalPath);
+  }
   if (!watermarked) return signingFailed();
-
-  // Same `{user_id}/{photo_id}.jpg` shape as the photos bucket. Upsert, so
-  // a retry after a later step failed just overwrites the same object.
-  const { error: storeError } = await supabaseAdmin.storage
-    .from(ORIGINALS_BUCKET)
-    .upload(`${userID}/${photoID}.jpg`, signedCapture, {
-      contentType: "image/jpeg",
-      upsert: true,
-    });
-  if (storeError) throw storeError;
 
   return new Response(watermarked, {
     headers: { "Content-Type": "image/jpeg", [PIPELINE_HEADER]: CAPTURE_PIPELINE },
   });
 }
 
+/// What `invokePipeline` returns for a Lambda that predates `/pipeline`.
+const NO_PIPELINE_ROUTE = Symbol("no /pipeline route");
+
+/// Steps 1–3 of the capture pipeline, with one Lambda call doing 1 and 2:
+/// `rawCapture` goes to `signing-handoff`, and the Lambda is sent a download
+/// link for it and an upload link each for the original and the photo. The photo is fetched and
+/// checked against the SHA-256 the Lambda reports for it, while the original
+/// is copied to `originalPath` in `photo-originals` inside Storage — its bytes
+/// never pass through this function, so they're not re-hashed here; the hash
+/// the Lambda reported is logged.
+///
+/// Returns the photo; null on a Lambda error, a photo that doesn't match, or
+/// a response not confirming it ran `pipeline` (each logged); or
+/// `NO_PIPELINE_ROUTE` if the Lambda answered 404.
+async function invokePipeline(
+  rawCapture: ArrayBuffer,
+  originalPath: string,
+): Promise<ArrayBuffer | null | typeof NO_PIPELINE_ROUTE> {
+  const callID = crypto.randomUUID();
+  const inputPath = `${callID}/pipeline-in.jpg`;
+  const handoffOriginalPath = `${callID}/pipeline-original.jpg`;
+  const photoPath = `${callID}/pipeline-photo.jpg`;
+
+  try {
+    const [sourceURL, originalURL, photoURL] = await stageHandoff(inputPath, rawCapture, [
+      handoffOriginalPath,
+      photoPath,
+    ]);
+    const lambdaResponse = await postToLambda("pipeline", {
+      source_url: sourceURL,
+      original_url: originalURL,
+      photo_url: photoURL,
+    });
+    // `Route::for_path` 404s a path it doesn't know, before reading the body.
+    if (lambdaResponse.status === 404) {
+      await lambdaResponse.body?.cancel();
+      return NO_PIPELINE_ROUTE;
+    }
+    // A Lambda that ran anything but `pipeline` didn't make the photo.
+    if (!(await isUsableAnswer(lambdaResponse, "pipeline", { requireRouteConfirmation: true }))) {
+      return null;
+    }
+    const reported = await lambdaResponse.json() as { original?: Reported; photo?: Reported };
+    if (!reported.original || !reported.photo) {
+      console.error("Signing Lambda's /pipeline answer doesn't describe both outputs", reported);
+      return null;
+    }
+
+    const [photo] = await settleBoth(
+      fetchOutput(photoPath, reported.photo, "/pipeline photo"),
+      keepOriginal(handoffOriginalPath, originalPath, reported.original),
+    );
+    return photo;
+  } finally {
+    cleanUpLater(callID, [inputPath, handoffOriginalPath, photoPath]);
+  }
+}
+
+/// The capture pipeline for a Lambda that predates `/pipeline`: `/capture`,
+/// then `/watermark` on its output while the signed capture is stored — in
+/// parallel rather than after, as it's needed either way. If the watermark
+/// step fails the original is still stored, and a retry overwrites it.
+async function signInTwoCalls(
+  rawCapture: ArrayBuffer,
+  originalPath: string,
+): Promise<ArrayBuffer | null> {
+  const signedCapture = await invokeLambda("capture", rawCapture);
+  if (!signedCapture) return null;
+
+  const [watermarked] = await settleBoth(
+    // `requireRouteConfirmation`: a Lambda that predates routing ignores the
+    // path and would sign this as another capture — no watermark — and the
+    // app would upload it. Only a Lambda that says it ran `watermark` is
+    // believed.
+    invokeLambda("watermark", signedCapture, { requireRouteConfirmation: true }),
+    supabaseAdmin.storage
+      .from(ORIGINALS_BUCKET)
+      .upload(originalPath, signedCapture, { contentType: "image/jpeg", upsert: true })
+      .then(({ error }) => {
+        if (error) throw error;
+      }),
+  );
+  return watermarked;
+}
+
+/// Copies the original from its hand-off object to `originalPath` in
+/// `photo-originals`, replacing whatever an earlier attempt left there.
+///
+/// A copy inside Storage rather than a download and upload, so the bytes stay
+/// in Storage's region. storage-js's `copy` can't overwrite — it never sends
+/// `x-upsert` — so this calls the copy endpoint itself. Should the copy be
+/// refused, the original is passed through this function instead, as before
+/// `/pipeline`, rather than failing the photo.
+async function keepOriginal(
+  handoffPath: string,
+  originalPath: string,
+  reported: Reported,
+): Promise<void> {
+  const copied = await fetch(`${SUPABASE_URL}/storage/v1/object/copy`, {
+    method: "POST",
+    headers: {
+      apikey: SUPABASE_SERVICE_ROLE_KEY,
+      Authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+      "Content-Type": "application/json",
+      "x-upsert": "true",
+    },
+    body: JSON.stringify({
+      bucketId: HANDOFF_BUCKET,
+      sourceKey: handoffPath,
+      destinationBucket: ORIGINALS_BUCKET,
+      destinationKey: originalPath,
+    }),
+  });
+  if (copied.ok) {
+    await copied.body?.cancel();
+    console.log("Kept the signed capture", { path: originalPath, ...reported });
+    return;
+  }
+
+  console.error(
+    "Couldn't copy the signed capture inside Storage; passing it through instead",
+    copied.status,
+    await copied.text(),
+  );
+  const { data: original, error: getError } = await supabaseAdmin.storage
+    .from(HANDOFF_BUCKET)
+    .download(handoffPath);
+  if (getError || !original) throw getError ?? new Error("no original object");
+  const { error: storeError } = await supabaseAdmin.storage
+    .from(ORIGINALS_BUCKET)
+    .upload(originalPath, original, { contentType: "image/jpeg", upsert: true });
+  if (storeError) throw storeError;
+  console.log("Kept the signed capture", { path: originalPath, ...reported });
+}
+
 /// Response header in which the Lambda names the route it actually ran.
 /// Mirrored in aws-signing-lambda/src/main.rs.
 const LAMBDA_ROUTE_HEADER = "x-signing-route";
+
+/// How the Lambda describes each output it wrote to the hand-off.
+type Reported = { bytes?: number; sha256?: string };
 
 /// Has the signing Lambda run `route` — "capture" (sign as-is as a capture)
 /// or "watermark" (watermark a signed capture and sign the result) — on
@@ -228,7 +360,8 @@ const LAMBDA_ROUTE_HEADER = "x-signing-route";
 /// never in the request: `body` is put in `signing-handoff`, and the Lambda is
 /// POSTed (SigV4-signed) a download link for it and an upload link for its
 /// output, which is then fetched and checked against the SHA-256 the Lambda
-/// reports. Both objects are deleted whatever happens.
+/// reports. Both objects are deleted whatever happens, once the response has
+/// gone.
 ///
 /// Null on a Lambda error, a result that doesn't match, or, with
 /// `requireRouteConfirmation`, a response that doesn't name `route` in
@@ -238,92 +371,159 @@ async function invokeLambda(
   body: ArrayBuffer,
   { requireRouteConfirmation = false } = {},
 ): Promise<ArrayBuffer | null> {
-  const handoff = supabaseAdmin.storage.from(HANDOFF_BUCKET);
   const callID = crypto.randomUUID();
   const inputPath = `${callID}/${route}-in.jpg`;
   const outputPath = `${callID}/${route}-out.jpg`;
 
   try {
-    const { error: putError } = await handoff.upload(inputPath, body, {
+    const [sourceURL, destURL] = await stageHandoff(inputPath, body, [outputPath]);
+    const lambdaResponse = await postToLambda(route, { source_url: sourceURL, dest_url: destURL });
+    if (!(await isUsableAnswer(lambdaResponse, route, { requireRouteConfirmation }))) return null;
+    const reported = await lambdaResponse.json() as Reported;
+    return await fetchOutput(outputPath, reported, `/${route} output`);
+  } finally {
+    cleanUpLater(callID, [inputPath, outputPath]);
+  }
+}
+
+/// Puts `input` in `signing-handoff` at `inputPath` and makes the Lambda's
+/// links: a download link for it, then an upload link for each of
+/// `outputPaths`, in that order. The upload links don't wait for the input.
+async function stageHandoff(
+  inputPath: string,
+  input: ArrayBuffer,
+  outputPaths: string[],
+): Promise<string[]> {
+  const handoff = supabaseAdmin.storage.from(HANDOFF_BUCKET);
+  const source = (async () => {
+    const { error: putError } = await handoff.upload(inputPath, input, {
       contentType: "image/jpeg",
     });
     if (putError) throw putError;
+    const { data, error } = await handoff.createSignedUrl(inputPath, HANDOFF_LINK_SECONDS);
+    if (error || !data) throw error ?? new Error("no source link");
+    return data.signedUrl;
+  })();
+  // Upload links last two hours on Supabase's side and can't be shortened;
+  // each is good for exactly one object, once (no upsert), deleted after.
+  const outputs = outputPaths.map(async (path) => {
+    const { data, error } = await handoff.createSignedUploadUrl(path);
+    if (error || !data) throw error ?? new Error("no upload link");
+    return data.signedUrl;
+  });
+  return await Promise.all([source, ...outputs]);
+}
 
-    const { data: source, error: sourceError } = await handoff.createSignedUrl(
-      inputPath,
-      HANDOFF_LINK_SECONDS,
-    );
-    if (sourceError || !source) throw sourceError ?? new Error("no source link");
-    // Upload links last two hours on Supabase's side and can't be shortened;
-    // this one is good for exactly one object, which is deleted below.
-    const { data: dest, error: destError } = await handoff.createSignedUploadUrl(outputPath);
-    if (destError || !dest) throw destError ?? new Error("no upload link");
-
-    const requestBody = JSON.stringify({ source_url: source.signedUrl, dest_url: dest.signedUrl });
-    const base = new URL(LAMBDA_FUNCTION_URL);
-    const url = new URL(base.pathname.replace(/\/*$/, "/") + route, base);
-    const signedRequest = await signer.sign(
-      new HttpRequest({
-        method: "POST",
-        protocol: url.protocol,
-        hostname: url.hostname,
-        path: url.pathname,
-        headers: {
-          host: url.hostname,
-          "content-type": "application/json",
-          [TRANSPORT_HEADER]: STORAGE_TRANSPORT,
-        },
-        body: requestBody,
-      }),
-    );
-
-    const lambdaResponse = await fetch(url, {
-      method: signedRequest.method,
-      headers: signedRequest.headers,
+/// POSTs `links` to the Lambda's `route` as JSON, SigV4-signed, over the
+/// storage transport.
+async function postToLambda(route: string, links: Record<string, string>): Promise<Response> {
+  const requestBody = JSON.stringify(links);
+  const base = new URL(LAMBDA_FUNCTION_URL);
+  const url = new URL(base.pathname.replace(/\/*$/, "/") + route, base);
+  const signedRequest = await signer.sign(
+    new HttpRequest({
+      method: "POST",
+      protocol: url.protocol,
+      hostname: url.hostname,
+      path: url.pathname,
+      headers: {
+        host: url.hostname,
+        "content-type": "application/json",
+        [TRANSPORT_HEADER]: STORAGE_TRANSPORT,
+      },
       body: requestBody,
-    });
-    if (!lambdaResponse.ok) {
-      console.error(
-        "Signing Lambda returned",
-        lambdaResponse.status,
-        "for route",
-        route,
-        await lambdaResponse.text(),
-      );
-      return null;
-    }
-    const ranRoute = lambdaResponse.headers.get(LAMBDA_ROUTE_HEADER);
-    if (requireRouteConfirmation && ranRoute !== route) {
-      console.error(
-        `Signing Lambda answered /${route} without confirming it ran it`,
-        `(${LAMBDA_ROUTE_HEADER}: ${ranRoute ?? "absent"}) — is the deployed Lambda older than its routes?`,
-      );
-      return null;
-    }
-    // A Lambda that predates the hand-off would have treated the JSON as the
-    // photo and failed; one that answers without this header didn't use it.
-    if (lambdaResponse.headers.get(TRANSPORT_HEADER) !== STORAGE_TRANSPORT) {
-      console.error(`Signing Lambda answered /${route} without using the storage hand-off`);
-      return null;
-    }
-    const reported = await lambdaResponse.json() as { bytes?: number; sha256?: string };
+    }),
+  );
+  return await fetch(url, {
+    method: signedRequest.method,
+    headers: signedRequest.headers,
+    body: requestBody,
+  });
+}
 
-    const { data: output, error: getError } = await handoff.download(outputPath);
-    if (getError || !output) throw getError ?? new Error("no output object");
-    const result = await output.arrayBuffer();
-    const digest = toHex(await crypto.subtle.digest("SHA-256", result));
-    if (result.byteLength !== reported.bytes || digest !== reported.sha256) {
-      console.error(
-        `Signing Lambda's /${route} output doesn't match what it reported`,
-        { reported, got: { bytes: result.byteLength, sha256: digest } },
-      );
-      return null;
-    }
-    return result;
-  } finally {
-    const { error: cleanupError } = await handoff.remove([inputPath, outputPath]);
-    if (cleanupError) console.error("Couldn't clean up the signing hand-off", callID, cleanupError);
+/// Whether the Lambda's answer to `route` can be acted on: a success, over
+/// the storage hand-off, and — with `requireRouteConfirmation` — naming
+/// `route` in `x-signing-route`. Logs why not.
+async function isUsableAnswer(
+  lambdaResponse: Response,
+  route: string,
+  { requireRouteConfirmation = false } = {},
+): Promise<boolean> {
+  if (!lambdaResponse.ok) {
+    console.error(
+      "Signing Lambda returned",
+      lambdaResponse.status,
+      "for route",
+      route,
+      await lambdaResponse.text(),
+    );
+    return false;
   }
+  const ranRoute = lambdaResponse.headers.get(LAMBDA_ROUTE_HEADER);
+  if (requireRouteConfirmation && ranRoute !== route) {
+    console.error(
+      `Signing Lambda answered /${route} without confirming it ran it`,
+      `(${LAMBDA_ROUTE_HEADER}: ${ranRoute ?? "absent"}) — is the deployed Lambda older than its routes?`,
+    );
+    return false;
+  }
+  // A Lambda that predates the hand-off would have treated the JSON as the
+  // photo and failed; one that answers without this header didn't use it.
+  if (lambdaResponse.headers.get(TRANSPORT_HEADER) !== STORAGE_TRANSPORT) {
+    console.error(`Signing Lambda answered /${route} without using the storage hand-off`);
+    return false;
+  }
+  return true;
+}
+
+/// Downloads the hand-off object at `path` and checks it is exactly what the
+/// Lambda reported writing there. Null, logged, if it isn't.
+async function fetchOutput(
+  path: string,
+  reported: Reported,
+  what: string,
+): Promise<ArrayBuffer | null> {
+  const { data: output, error: getError } = await supabaseAdmin.storage
+    .from(HANDOFF_BUCKET)
+    .download(path);
+  if (getError || !output) throw getError ?? new Error("no output object");
+  const result = await output.arrayBuffer();
+  const digest = toHex(await crypto.subtle.digest("SHA-256", result));
+  if (result.byteLength !== reported.bytes || digest !== reported.sha256) {
+    console.error(
+      `Signing Lambda's ${what} doesn't match what it reported`,
+      { reported, got: { bytes: result.byteLength, sha256: digest } },
+    );
+    return null;
+  }
+  return result;
+}
+
+/// Deletes a call's hand-off objects once the response has gone: nothing
+/// waits on it, and a failure (logged) only leaves objects in a bucket no one
+/// but the service role can see.
+function cleanUpLater(callID: string, paths: string[]): void {
+  const cleanup = supabaseAdmin.storage
+    .from(HANDOFF_BUCKET)
+    .remove(paths)
+    .then(({ error }) => {
+      if (error) throw error;
+    })
+    .catch((error) => console.error("Couldn't clean up the signing hand-off", callID, error));
+  // Keeps the worker alive until it's done. Absent outside Supabase's
+  // runtime (a local `deno run`), where the promise just runs.
+  if (typeof EdgeRuntime !== "undefined") EdgeRuntime.waitUntil(cleanup);
+}
+
+/// Supabase's Edge runtime global; not in Deno's own types.
+declare const EdgeRuntime: { waitUntil(promise: Promise<unknown>): void } | undefined;
+
+/// Awaits both, then returns both results or throws the first failure — but
+/// never while the other is still running, so that nothing (a copy out of a
+/// hand-off object, say) is still in flight when the caller cleans up.
+async function settleBoth<A, B>(a: Promise<A>, b: Promise<B>): Promise<[A, B]> {
+  await Promise.allSettled([a, b]);
+  return [await a, await b];
 }
 
 function toHex(buffer: ArrayBuffer): string {

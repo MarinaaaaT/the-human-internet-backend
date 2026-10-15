@@ -32,13 +32,33 @@ non-technical process — see the app repo's `CLAUDE.md` Known Gap #1).
   returns ASN.1 DER-encoded ECDSA signatures; COSE ES256 needs fixed-width
   raw `r||s`. `p256::ecdsa::Signature::from_der(...).to_bytes()` does the
   conversion — confirmed correct against a real signature (see Status).
-- **Two routes** (`Route` in `src/main.rs`): `POST /capture` signs the body
-  as-is as a `digitalCapture` — step one of the capture pipeline, and all a
-  build predating server-side watermarking needs; `POST /watermark` takes a
-  capture *already signed by `/capture`*, burns the brand mark in and signs
-  the result with that signed capture as its `parentOf` ingredient
-  (`c2pa.opened` → `c2pa.placed`, the brand-mark PNG as a `componentOf` ingredient). `sign-photo` calls them in sequence; see
-  the repo root `CLAUDE.md`. Any other path 404s.
+- **Three routes** (`Route` in `src/main.rs`):
+  - `POST /pipeline` is the capture pipeline in **one call**: it downloads
+    the raw capture once, signs it as a `digitalCapture` (the original),
+    then watermarks that signed capture in memory and signs the result with
+    it as its `parentOf` ingredient (the photo), exactly as `/watermark`
+    does — minus `/watermark`'s `Reader` re-check of its input, since these
+    are bytes the same invocation signed a moment earlier
+    (`manifest::watermark_signed_capture`). The original is uploaded while
+    the photo is being made. Only over the Storage hand-off (two photos
+    never fit one Function URL response); without it, `400`. This is what
+    `sign-photo` calls.
+  - `POST /capture` signs the body as-is as a `digitalCapture` — all a
+    build predating server-side watermarking needs, and step one of the
+    two-call pipeline;
+  - `POST /watermark` takes a capture *already signed by `/capture`*,
+    burns the brand mark in and signs the result with that signed capture
+    as its `parentOf` ingredient (`c2pa.opened` → `c2pa.placed`, the
+    brand-mark PNG as a `componentOf` ingredient). `sign-photo` falls back
+    to `/capture` then `/watermark` when `/pipeline` 404s, i.e. against a
+    Lambda deployed before it; see the repo root `CLAUDE.md`.
+  - **Any other path 404s** — which is how `sign-photo` tells a Lambda
+    without `/pipeline` apart, so keep `Route::for_path` answering 404 for
+    unknown paths before anything looks at the body. `/capture` stays
+    regardless: it is the only route a request without the pipeline header
+    uses. Keep `/watermark` until the `sign-photo` that calls `/pipeline`
+    has been live for a while; after that only a rollback of `sign-photo`
+    would need it.
   - **`POST /` is a temporary alias for `/capture`.** The `sign-photo`
     deployed before routing existed POSTs to the Function URL's root, and
     this Lambda may be deployed first. Remove the alias (`Route::for_path`)
@@ -46,9 +66,10 @@ non-technical process — see the app repo's `CLAUDE.md` Known Gap #1).
     this Lambda.
   - **Every success names the route that ran** in `x-signing-route`.
     `sign-photo` refuses a `/watermark` response without
-    `x-signing-route: watermark`: the Lambda before routing ignored the path
-    and signed everything as a capture, which for `/watermark` would have
-    returned an *unwatermarked* photo for the app to publish.
+    `x-signing-route: watermark`, and a `/pipeline` one without
+    `x-signing-route: pipeline`: the Lambda before routing ignored the path
+    and signed everything as a capture, which would have returned an
+    *unwatermarked* photo for the app to publish.
 - `src/manifest.rs` — both manifests, hand-written JSON rather than typed
   assertion structs, because c2pa-rs's v2 actions assertion wants camelCase
   `digitalSourceType` and the typed builders don't reliably produce that.
@@ -59,13 +80,24 @@ non-technical process — see the app repo's `CLAUDE.md` Known Gap #1).
   links (download the input, upload the output) for two objects in the
   private `signing-handoff` bucket, instead of the photo. The Lambda
   downloads, signs as usual, uploads, and answers `{bytes, sha256}` so
-  `sign-photo` can check what it fetches. This exists because a Function URL
-  caps each request and response at 6MB after base64 (~4.5MB of JPEG) and a
-  detailed capture is bigger — it was a `413` before reaching this code.
+  `sign-photo` can check what it fetches. `/pipeline`'s body is
+  `{source_url, original_url, photo_url}` — one input, two outputs — and
+  its answer `{original: {bytes, sha256}, photo: {bytes, sha256}}`. This
+  exists because a Function URL caps each request and response at 6MB after
+  base64 (~4.5MB of JPEG) and a detailed capture is bigger — it was a `413`
+  before reaching this code.
   Links must be https on **`HANDOFF_STORAGE_HOST`** (a Lambda env var, the
   project's host); unset, the hand-off is refused and only photo-in-body
   requests work. No redirects are followed, and the source is capped at
   64MB. The Lambda holds no Supabase credentials.
+  **What it can reach** is only the objects those links name, all in
+  `signing-handoff`: the input (download, 5 minutes) and each output
+  (upload, once — the links are made without upsert, so each can write its
+  object only while it doesn't exist). It is never handed a link into
+  `photo-originals`; `sign-photo` copies the original there itself, inside
+  Storage. A Supabase upload link lasts 2 hours and can't be shortened,
+  which is why none points at anything that outlives the call. Errors drop
+  the URL (`reqwest::Error::without_url`), so no link reaches CloudWatch.
 - `src/watermark.rs` — composites the brand mark, **an image:
   `assets/brand-mark.png`** (embedded with `include_bytes!`), onto the
   decoded capture: width 9% of the shorter side, height from the PNG's own
@@ -87,12 +119,20 @@ non-technical process — see the app repo's `CLAUDE.md` Known Gap #1).
 - **Tests** (`cargo test --release`): the watermark's placement, colour
   rule and orientation handling, and both manifests read back through `c2pa::Reader`
   — `Valid`, with `signingCredential.untrusted` the only failure, the
-  capture's `digitalCapture` claim surviving inside the ingredient. They sign
-  with a throwaway CA minted per run by `rcgen`; no key is committed.
+  capture's `digitalCapture` claim surviving inside the ingredient; for
+  `/pipeline`, that the photo's parent ingredient carries the very manifest
+  the original was signed with. `handoff.rs` tests pin both body shapes and
+  that every link, all three for `/pipeline`, is held to the host check.
+  They sign with a throwaway CA minted per run by `rcgen`; no key is committed.
 - **Sizing.** `/watermark` decodes, draws and re-encodes a full-resolution
-  JPEG. At the current 768MB / 10s, check a real 12MP capture's duration in
-  CloudWatch after deploying; raising to ~1536MB (Lambda CPU scales with
-  memory) and a 30s timeout is the likely fix if it's tight.
+  JPEG; `/pipeline` does that and signs the capture in the same
+  invocation, so its duration is roughly `/capture`'s plus `/watermark`'s
+  minus one download and one upload. At the current 768MB / 30s, check a
+  real 12MP capture's duration in CloudWatch after deploying; raising to
+  ~1536MB (Lambda CPU scales with memory) is the likely fix if it's tight.
+  The decode is its own step (`watermark::decode_capture`) so that the
+  thumbnails c2pa makes by decoding again (`add_thumbnails`) can later be
+  built from the same pixels.
 
 ## Building
 
@@ -149,7 +189,12 @@ Point the function at a **digest**, not a tag, so what's running is exactly
 what was built and the previous digest is a one-line rollback
 (`update-function-code --image-uri $REPO@<old digest>`). Then smoke-test
 `/capture` → `/watermark` as below and check both the manifest and the
-mark. Deploy history: 2026-09-25 `sha256:d572c32…` (server-side
+mark. `/pipeline` can only be exercised through `sign-photo` (see Testing
+below): once the `sign-photo` that calls it is deployed too, take one photo
+through the app with `server_side_watermark` on — `sign-photo` should log
+"Kept the signed capture" and never "has no /pipeline route yet" — and
+check the photo's manifest, its mark, and its object in `photo-originals`.
+Deploy history: 2026-09-25 `sha256:d572c32…` (server-side
 watermark); 2026-10-10 `sha256:6c22a64…` (fingerprint mark, adaptive
 black/white); 2026-10-11 `sha256:276cf97…` (ingredient thumbnails, `c2pa.placed`). Rollback from that one: `sha256:ad52a1f…`. 2026-10-11 `sha256:eb7a099…` (mark ingredient as drawn, JPEG thumbnail); rollback `sha256:276cf97…`.
 
@@ -229,8 +274,9 @@ that only postpones it.
   deliberately far below both that new ceiling and the downstream limits
   that would otherwise throttle under real concurrency: the KMS key's
   shared `Cryptographic operations (ECC & SM2)` quota is 1000 req/s
-  account-wide, and this Lambda spends up to 2 `Sign` calls per photo
-  (`/capture` + `/watermark`); SSM's `GetParameter` quota (read once per
+  account-wide, and this Lambda spends 3 `Sign` calls per photo (the
+  capture, the brand mark, the photo — in one `/pipeline` call, or split
+  1 + 2 across `/capture` and `/watermark`); SSM's `GetParameter` quota (read once per
   cold start, for the cert chain) is only 40 req/s, so an uncapped burst of
   concurrent cold starts would throttle there first. If real traffic ever
   needs to grow past 5, raise this deliberately rather than removing the
@@ -241,7 +287,9 @@ that only postpones it.
 `aws lambda invoke` can hit the function directly with a Function-URL-shaped
 event payload, bypassing SigV4 entirely for a quick smoke test. For
 `/watermark`, set both paths to `/watermark` and send the *output* of a
-`/capture` call — a raw JPEG is refused as not a signed capture:
+`/capture` call — a raw JPEG is refused as not a signed capture.
+`/pipeline` can't be tested this way: it only takes Storage links, so test
+it through `sign-photo` (see Deploying).
 
 ```json
 {
