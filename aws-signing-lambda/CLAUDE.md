@@ -34,13 +34,19 @@ non-technical process — see the app repo's `CLAUDE.md` Known Gap #1).
   conversion — confirmed correct against a real signature (see Status).
 - **Three routes** (`Route` in `src/main.rs`):
   - `POST /pipeline` is the capture pipeline in **one call**: it downloads
-    the raw capture once, signs it as a `digitalCapture` (the original),
-    then watermarks that signed capture in memory and signs the result with
-    it as its `parentOf` ingredient (the photo), exactly as `/watermark`
-    does — minus `/watermark`'s `Reader` re-check of its input, since these
-    are bytes the same invocation signed a moment earlier
-    (`manifest::watermark_signed_capture`). The original is uploaded while
-    the photo is being made. Only over the Storage hand-off (two photos
+    the raw capture once and **decodes it once**, signs it as a
+    `digitalCapture` (the original) with a thumbnail made from those pixels
+    (`manifest::sign_original`), then watermarks the same pixels and signs
+    the result with the signed capture as its `parentOf` ingredient (the
+    photo), exactly as `/watermark` does — minus `/watermark`'s `Reader`
+    re-check of its input and its second decode, since these are bytes the
+    same invocation signed a moment earlier
+    (`manifest::watermark_signed_capture`). Reusing the raw capture's pixels
+    for the photo rests on signing changing no pixel: c2pa only inserts APP11
+    segments, so the original decodes to exactly the raw capture's pixels,
+    orientation and ICC profile included
+    (`the_signed_capture_decodes_to_the_raw_captures_pixels`). The original
+    is uploaded while the photo is being made. Only over the Storage hand-off (two photos
     never fit one Function URL response); without it, `400`. This is what
     `sign-photo` calls.
   - `POST /capture` signs the body as-is as a `digitalCapture` — all a
@@ -116,19 +122,70 @@ non-technical process — see the app repo's `CLAUDE.md` Known Gap #1).
   `brand_mark_watermark`**; to change the artwork, replace it in all three
   repos (transparent background, ≥ ~600px wide) and update the dimension
   check in each repo's tests (1024×1082 today).
+- `src/thumbnail.rs` — **claim thumbnails, supplied rather than generated.**
+  A claim thumbnail (C2PA 2.2 §18.13) is an optional, approximate picture of
+  the asset when it was signed, at most one per manifest, in any format;
+  validators check its hash but never compare it with the asset's pixels. It
+  is what the Content Credentials viewer pictures a manifest by, and an
+  ingredient by too, through *that ingredient's own* manifest's claim
+  thumbnail (§18.13.1.2). Without one the card is blank. c2pa-rs's
+  `add_thumbnails` feature makes one whenever a definition has no
+  `thumbnail`: it decodes the whole JPEG being signed, applies orientation,
+  downscales and re-encodes (~110ms per 12MP capture on an M1 core, an
+  estimated ~0.5s here). So every manifest now names its own:
+  - the **original** (`/pipeline`) and the **photo**: made by
+    `thumbnail::from_pixels` from the upright pixels already decoded for the
+    watermark, the photo's after the mark is composited;
+  - a **`/capture`** signed on its own: `thumbnail::from_jpeg_scaled`
+    decodes the JPEG at 1/8, 1/4 or 1/2 scale (the smallest that is still
+    ≥768px on the long edge — 1/4 for a 12MP iPhone capture) with
+    `jpeg-decoder`, whose IDCT can scale (image's own decoder, zune-jpeg,
+    can't), then applies EXIF orientation;
+  - the **brand mark**: its 512px JPEG (`watermark::Watermarked::mark_thumbnail_jpeg`),
+    the one thumbnail that's cached, once per colour, since nothing else
+    about the photo changes it.
+
+  Original, photo and `/capture` match c2pa's defaults
+  (`ThumbnailSettings::default()`, pinned by a test): JPEG at quality 75
+  (`Medium`), 1024px long edge (768–1024 for `/capture`), upright, with the
+  same `imageops::thumbnail` downscale. Two deliberate differences: nothing
+  smaller is enlarged to 1024, and **the capture's ICC profile is embedded**
+  (Display P3 on an iPhone, ~0.5KB) so the thumbnail shows the photo's
+  colours. c2pa's has no profile, so its P3 values get read as sRGB and look
+  duller. Every thumbnail is made from its own asset's pixels at signing
+  time, and none is reused across photos.
+
+  **Ingredients reference their own claim thumbnails**
+  (`manifest::add_signed_ingredient`): the photo's `parentOf` ingredient
+  points at the original's `c2pa.thumbnail.claim`, the `componentOf` one at
+  the mark's. c2pa-rs only makes that reference itself for an ingredient
+  that validates with *no* failure, and with our dev CA there is always one,
+  `signingCredential.untrusted` (Gotcha 4). Until 2026-10-14 every photo
+  therefore embedded freshly generated `c2pa.thumbnail.ingredient`s instead:
+  the capture decoded a second time, and the transparent mark enlarged to a
+  1024px PNG (~400KB per photo). The reference is now given explicitly, as a
+  hashed URI read from the ingredient's own manifest.
+
+  **Why `add_thumbnails` stays on.** With a thumbnail named, c2pa makes
+  none, so leaving the feature on costs nothing. It is also the fallback in
+  every case where this code has no thumbnail to give: a `/capture` JPEG
+  `jpeg-decoder` can't read (CMYK, 16-bit, malformed), or an ingredient
+  without a claim thumbnail to point at (a capture signed before
+  2026-10-11). Turning it off would give those cases a blank card instead of
+  a slower thumbnail. Leave the feature and its settings alone.
 - `src/timing.rs` — **where an invocation's time goes**, as one `timing` log
   event per step with `ms`: `download`, `decode`, `draw_mark`, `encode`
   (with the `quality` it ended at and how many `attempts` `encode_within`
-  needed), `check_input` (`/watermark`'s `Reader`), `add_ingredient`,
+  needed), `thumbnail` (`asset`, `from`), `mark_thumbnail` (once per colour
+  per instance), `check_input` (`/watermark`'s `Reader`), `add_ingredient`,
   `sign` (`manifest`: `capture`, `mark`, `photo` — each includes its KMS
-  round trip), `upload` (`output`), and `total` (`path`, `status`). c2pa
-  makes its thumbnails inside `sign` and `add_ingredient`, so their decoding
-  is counted there. Events from the signing thread carry the invocation's
-  `requestId` like the rest. In CloudWatch Logs Insights:
+  round trip), `upload` (`output`), and `total` (`path`, `status`). Events
+  from the signing thread carry the invocation's `requestId` like the rest.
+  In CloudWatch Logs Insights:
 
   ```text
   filter fields.message = "timing"
-  | stats avg(fields.ms), pct(fields.ms, 90), count() by fields.step, fields.manifest
+  | stats avg(fields.ms), pct(fields.ms, 90), count() by fields.step, fields.manifest, fields.asset
   ```
 
   and `filter span.requestId = "<id>"` for one invocation, step by step.
@@ -137,7 +194,12 @@ non-technical process — see the app repo's `CLAUDE.md` Known Gap #1).
   — `Valid`, with `signingCredential.untrusted` the only failure, the
   capture's `digitalCapture` claim surviving inside the ingredient; for
   `/pipeline`, that the photo's parent ingredient carries the very manifest
-  the original was signed with. `handoff.rs` tests pin both body shapes and
+  the original was signed with. Thumbnails, through both `/pipeline` and
+  `/capture` + `/watermark`: the photo, the original and the mark each have
+  exactly one, and the photo embeds no other; its ingredients reference the
+  original's and the mark's; an orientation-6 capture gets upright ones;
+  the photo's shows the mark and the original's doesn't; and the signed
+  original decodes to the raw capture's exact pixels. `handoff.rs` tests pin both body shapes and
   that every link, all three for `/pipeline`, is held to the host check.
   They sign with a throwaway CA minted per run by `rcgen`; no key is committed.
 - **Sizing.** `/watermark` decodes, draws and re-encodes a full-resolution
@@ -146,9 +208,11 @@ non-technical process — see the app repo's `CLAUDE.md` Known Gap #1).
   minus one download and one upload. At the current 768MB / 30s, check a
   real 12MP capture's duration in CloudWatch after deploying; raising to
   ~1536MB (Lambda CPU scales with memory) is the likely fix if it's tight.
-  The decode is its own step (`watermark::decode_capture`) so that the
-  thumbnails c2pa makes by decoding again (`add_thumbnails`) can later be
-  built from the same pixels.
+  The `timing` logs (`src/timing.rs`) say which step to look at first. On a
+  synthetic 4.5MB 12MP capture on an M1 core, the full-resolution `encode`
+  dominated `/pipeline` once thumbnails stopped decoding: ~150ms per
+  attempt, three attempts for a noise-heavy image that overshoots the 4MB
+  cap at 95 and 90.
 
 ## Building
 
@@ -262,6 +326,17 @@ that only postpones it.
    `cargo build --release` without one dropped \~1.3GB of build artifacts
    into a parent repo's working tree, unignored. This directory now has
    its own `.gitignore` for exactly this reason.
+4. **c2pa-rs won't point an ingredient at an untrusted manifest's claim
+   thumbnail.** `Ingredient::update_validation_status` only references the
+   ingredient's claim thumbnail when its active manifest has *no* failure,
+   and `signingCredential.untrusted` counts. Our dev CA isn't on the trust
+   list, so c2pa silently decoded every ingredient and embedded a new
+   thumbnail instead. Nothing looked wrong: the reader still reported
+   `Valid` and an ingredient thumbnail. It only showed in the assertion
+   list (`c2pa.thumbnail.ingredient`). `manifest::add_signed_ingredient`
+   names the reference explicitly. Once the certificate is trusted c2pa
+   would make the same reference itself, and the explicit one stays
+   correct.
 
 ## AWS resources this depends on (us-east-2, account `141218266378`)
 

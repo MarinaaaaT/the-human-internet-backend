@@ -39,7 +39,7 @@ use std::io::Cursor;
 use std::sync::OnceLock;
 use std::time::Instant;
 
-use crate::timing;
+use crate::{thumbnail, timing};
 
 /// Mark width as a fraction of the image's shorter side.
 pub const MARK_SIZE_FRACTION: f32 = 0.09;
@@ -70,6 +70,10 @@ const BRAND_MARK_PNG: &[u8] = include_bytes!("../assets/brand-mark.png");
 pub struct Watermarked {
     /// The photo with the mark burned in.
     pub jpeg: Vec<u8>,
+    /// The photo's claim thumbnail, made from the same pixels as
+    /// [`Self::jpeg`], mark and all, before they were encoded. See
+    /// `thumbnail.rs` for why it's made here rather than by c2pa.
+    pub thumbnail_jpeg: Vec<u8>,
     /// The mark on its own: a transparent PNG at the size it was drawn,
     /// filled with the colour [`mark_color`] chose for this photo. It is the
     /// manifest's `c2pa.placed` ingredient, so a Content Credentials viewer
@@ -79,8 +83,9 @@ pub struct Watermarked {
     /// [`Self::mark_png`]'s thumbnail, for its own manifest: the same mark,
     /// same colour, as an opaque JPEG on the opposite colour. Supplied rather
     /// than generated — c2pa would make a transparent PNG, and a white mark
-    /// on a light card would vanish.
-    pub mark_thumbnail_jpeg: Vec<u8>,
+    /// on a light card would vanish. It depends on the colour alone, so it's
+    /// made once per colour per Lambda instance — the only thumbnail that is.
+    pub mark_thumbnail_jpeg: &'static [u8],
 }
 
 /// Longest edge of [`Watermarked::mark_thumbnail_jpeg`], and how much of it
@@ -90,9 +95,9 @@ const MARK_THUMBNAIL_FILL: f32 = 0.7;
 
 /// A capture's pixels, upright, and the ICC profile they're in.
 ///
-/// Decoding is its own step, apart from [`watermark`], so that one decode can
-/// serve more than the mark — the thumbnails c2pa currently decodes the
-/// capture again to make (`add_thumbnails`) could be built from these.
+/// Decoding is its own step, apart from [`watermark`], so that one decode
+/// serves everything that needs the pixels: in `/pipeline`, the original's
+/// claim thumbnail and then the watermark, which also makes the photo's.
 pub struct DecodedCapture {
     pub rgb: RgbImage,
     pub icc_profile: Option<Vec<u8>>,
@@ -127,7 +132,8 @@ pub fn decode_capture(jpeg: &[u8]) -> Result<DecodedCapture> {
 }
 
 /// Burns the brand mark into `capture` and re-encodes it as a JPEG, carrying
-/// its ICC profile over; returns that along with the mark as drawn.
+/// its ICC profile over; returns that along with its claim thumbnail and the
+/// mark as drawn.
 pub fn watermark(capture: DecodedCapture) -> Result<Watermarked> {
     let DecodedCapture { mut rgb, icc_profile } = capture;
 
@@ -140,6 +146,7 @@ pub fn watermark(capture: DecodedCapture) -> Result<Watermarked> {
     let (mark_png, color) = timing::time("draw_mark", || draw_mark(&mut rgb, is_display_p3))?;
 
     Ok(Watermarked {
+        thumbnail_jpeg: thumbnail::from_pixels("photo", &rgb, icc_profile.as_deref())?,
         jpeg: encode_within(&rgb, icc_profile.as_deref(), MAX_WATERMARKED_JPEG_BYTES)?,
         mark_png,
         mark_thumbnail_jpeg: mark_thumbnail(color)?,
@@ -147,7 +154,21 @@ pub fn watermark(capture: DecodedCapture) -> Result<Watermarked> {
 }
 
 /// See [`Watermarked::mark_thumbnail_jpeg`].
-fn mark_thumbnail(color: MarkColor) -> Result<Vec<u8>> {
+fn mark_thumbnail(color: MarkColor) -> Result<&'static [u8]> {
+    static BLACK: OnceLock<Vec<u8>> = OnceLock::new();
+    static WHITE: OnceLock<Vec<u8>> = OnceLock::new();
+    let cached = match color {
+        MarkColor::Black => &BLACK,
+        MarkColor::White => &WHITE,
+    };
+    if let Some(jpeg) = cached.get() {
+        return Ok(jpeg);
+    }
+    let jpeg = timing::time("mark_thumbnail", || draw_mark_thumbnail(color))?;
+    Ok(cached.get_or_init(|| jpeg))
+}
+
+fn draw_mark_thumbnail(color: MarkColor) -> Result<Vec<u8>> {
     let background = match color {
         MarkColor::Black => MarkColor::White,
         MarkColor::White => MarkColor::Black,
@@ -190,7 +211,7 @@ fn encode_within(rgb: &RgbImage, icc_profile: Option<&[u8]>, max_bytes: usize) -
     Ok(out)
 }
 
-fn encode(rgb: &RgbImage, icc_profile: Option<&[u8]>, quality: u8) -> Result<Vec<u8>> {
+pub(crate) fn encode(rgb: &RgbImage, icc_profile: Option<&[u8]>, quality: u8) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     let mut encoder = JpegEncoder::new_with_quality(&mut out, quality);
     if let Some(icc) = icc_profile {
@@ -356,6 +377,7 @@ fn utf16be(s: &str) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{with_exif_orientation, OFF_STROKE, ON_STROKE};
     use image::{GenericImageView, Rgb};
 
     fn watermark_jpeg(jpeg: &[u8]) -> Result<Watermarked> {
@@ -386,12 +408,6 @@ mod tests {
     fn is_black(p: &Rgb<u8>) -> bool {
         p.0.iter().all(|&c| c < 20)
     }
-
-    /// A point on the spiral's solid stroke, in mark-box fractions: the
-    /// outer ring (1–12% across, halfway down the artwork).
-    const ON_STROKE: (f32, f32) = (0.065, 0.5);
-    /// The gap between the outer ring and the next (13–20%), same row.
-    const OFF_STROKE: (f32, f32) = (0.165, 0.5);
 
     fn at(out: &RgbImage, x: f32, y: f32, size: f32, aspect: f32, (fx, fy): (f32, f32)) -> Rgb<u8> {
         *out.get_pixel((x + size * fx) as u32, (y + size * aspect * fy) as u32)
@@ -562,7 +578,7 @@ mod tests {
         let w = side * MARK_THUMBNAIL_FILL / aspect.max(1.0);
         let (x, y) = ((side - w) / 2.0, (side - w * aspect) / 2.0);
         for (level, mark, background) in [(25u8, 255u8, 0u8), (230, 0, 255)] {
-            let thumb = decode(&watermark_jpeg(&solid_jpeg(1000, 800, level)).unwrap().mark_thumbnail_jpeg);
+            let thumb = decode(watermark_jpeg(&solid_jpeg(1000, 800, level)).unwrap().mark_thumbnail_jpeg);
             assert_eq!(thumb.dimensions(), (MARK_THUMBNAIL_SIZE, MARK_THUMBNAIL_SIZE));
             let corner = thumb.get_pixel(2, 2).0;
             assert!(corner.iter().all(|&c| c.abs_diff(background) < 20), "level {level}: {corner:?}");
@@ -571,32 +587,19 @@ mod tests {
         }
     }
 
+    /// The one thumbnail made once and kept: per colour, since nothing else
+    /// about the photo changes it.
+    #[test]
+    fn the_mark_thumbnail_is_made_once_per_colour() {
+        let dark = || watermark_jpeg(&solid_jpeg(400, 300, 25)).unwrap().mark_thumbnail_jpeg;
+        let light = watermark_jpeg(&solid_jpeg(400, 300, 230)).unwrap().mark_thumbnail_jpeg;
+        assert!(std::ptr::eq(dark(), dark()));
+        assert_ne!(dark(), light);
+    }
+
     #[test]
     fn non_images_are_rejected() {
         assert!(watermark_jpeg(b"definitely not a jpeg").is_err());
-    }
-
-    /// Inserts a minimal APP1/EXIF segment carrying just an Orientation tag
-    /// straight after SOI.
-    fn with_exif_orientation(jpeg: &[u8], orientation: u16) -> Vec<u8> {
-        let mut tiff = vec![b'M', b'M', 0, 42, 0, 0, 0, 8]; // big-endian, IFD0 at 8
-        tiff.extend_from_slice(&1u16.to_be_bytes()); // one entry
-        tiff.extend_from_slice(&0x0112u16.to_be_bytes()); // Orientation
-        tiff.extend_from_slice(&3u16.to_be_bytes()); // SHORT
-        tiff.extend_from_slice(&1u32.to_be_bytes()); // count
-        tiff.extend_from_slice(&orientation.to_be_bytes());
-        tiff.extend_from_slice(&[0, 0]);
-        tiff.extend_from_slice(&0u32.to_be_bytes()); // no next IFD
-        let mut payload = b"Exif\0\0".to_vec();
-        payload.extend_from_slice(&tiff);
-        let mut out = jpeg[..2].to_vec();
-        out.extend_from_slice(&[0xFF, 0xE1]);
-        out.extend_from_slice(&((payload.len() + 2) as u16).to_be_bytes());
-        out.extend_from_slice(&payload);
-        out.extend_from_slice(&jpeg[2..]);
-        let decoded = image::load_from_memory(&out).unwrap();
-        assert_eq!(decoded.dimensions(), (1200, 900), "fixture should decode un-rotated");
-        out
     }
 }
 

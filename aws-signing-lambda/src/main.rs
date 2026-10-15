@@ -1,6 +1,9 @@
 mod handoff;
 mod kms_signer;
 mod manifest;
+#[cfg(test)]
+mod test_support;
+mod thumbnail;
 mod timing;
 mod watermark;
 
@@ -139,9 +142,11 @@ async fn dispatch(req: Request, key: SigningKey) -> Result<Response<Body>, Error
     handoff_answer(route, &stored)
 }
 
-/// `/pipeline`: one download, both signatures, two uploads. The original's
-/// upload runs while the photo is being watermarked and signed, so of the two
-/// only the photo's is on the critical path.
+/// `/pipeline`: one download, one decode, both signatures, two uploads. The
+/// capture's pixels, decoded once before the original is signed, make the
+/// original's thumbnail and are then watermarked into the photo. The
+/// original's upload runs while the photo is being made, so of the two only
+/// the photo's is on the critical path.
 async fn pipeline(body: &[u8], key: SigningKey) -> Result<Response<Body>, Error> {
     let allowed_host = std::env::var(handoff::ALLOWED_HOST_ENV).ok();
     let request = match handoff::PipelineRequest::parse(body, allowed_host.as_deref()) {
@@ -151,11 +156,11 @@ async fn pipeline(body: &[u8], key: SigningKey) -> Result<Response<Body>, Error>
     let client = handoff::client()?;
     let raw_capture = handoff::fetch_source(&client, &request.source_url).await?;
 
-    let original = key.run(move |signer| Ok(manifest::sign_capture(&raw_capture, signer)?)).await?;
+    let (original, capture) = key.run(move |signer| manifest::sign_original(&raw_capture, signer)).await?;
     let watermarking = original.clone();
     let (original, photo) = tokio::try_join!(
         handoff::store_result(&client, &request.original_url, original, "original"),
-        key.run(move |signer| manifest::watermark_signed_capture(&watermarking, signer)),
+        key.run(move |signer| manifest::watermark_signed_capture(&watermarking, capture, signer)),
     )?;
     let photo = handoff::store_result(&client, &request.photo_url, photo, "photo").await?;
 

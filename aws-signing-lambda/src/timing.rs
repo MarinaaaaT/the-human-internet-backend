@@ -13,11 +13,11 @@
 //!
 //! and `filter span.requestId = "…"` lays out a single invocation. The steps:
 //! `download`, `decode`, `draw_mark`, `encode` (with `quality` and
-//! `attempts`), `check_input`, `add_ingredient` (with `ingredient`), `sign`
-//! (with `manifest`: `capture`, `mark` or `photo`), `upload` (with
-//! `output`), and `total` (with `path` and `status`) once per invocation.
-//! c2pa makes claim and ingredient thumbnails inside `sign` and
-//! `add_ingredient`, by decoding the asset, so their time is counted there.
+//! `attempts`), `thumbnail` (with `asset`: `capture` or `photo`, and `from`:
+//! `pixels` or `scaled_decode`), `mark_thumbnail` (only when it isn't cached
+//! yet), `check_input`, `add_ingredient` (with `ingredient`), `sign` (with
+//! `manifest`: `capture`, `mark` or `photo`), `upload` (with `output`), and
+//! `total` (with `path` and `status`) once per invocation.
 
 use std::time::Instant;
 
