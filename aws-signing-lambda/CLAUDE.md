@@ -196,7 +196,7 @@ through the app with `server_side_watermark` on — `sign-photo` should log
 check the photo's manifest, its mark, and its object in `photo-originals`.
 Deploy history: 2026-09-25 `sha256:d572c32…` (server-side
 watermark); 2026-10-10 `sha256:6c22a64…` (fingerprint mark, adaptive
-black/white); 2026-10-11 `sha256:276cf97…` (ingredient thumbnails, `c2pa.placed`). Rollback from that one: `sha256:ad52a1f…`. 2026-10-11 `sha256:eb7a099…` (mark ingredient as drawn, JPEG thumbnail); rollback `sha256:276cf97…`.
+black/white); 2026-10-11 `sha256:276cf97…` (ingredient thumbnails, `c2pa.placed`). Rollback from that one: `sha256:ad52a1f…`. 2026-10-11 `sha256:eb7a099…` (mark ingredient as drawn, JPEG thumbnail); rollback `sha256:276cf97…`. 2026-10-11 `sha256:ac3c4a6…` (ECR tag `2363eab`, the third that day; deployed but not recorded here at the time). 2026-10-14 `sha256:aafdb44…` (`35385c9`, the `/pipeline` route); rollback `sha256:ac3c4a6…`.
 
 **Build straight to `$REPO:$TAG`, never via a `latest` tag.** A failed build
 produces no image but leaves an old `latest` in place, and on 2026-10-11 a
