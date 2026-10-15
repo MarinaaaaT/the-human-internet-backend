@@ -1,7 +1,8 @@
 use c2pa::{Builder, Reader, Result as C2paResult, Signer};
 use std::io::Cursor;
+use std::time::Instant;
 
-use crate::watermark;
+use crate::{timing, watermark};
 
 /// IPTC term asserting the image came off a physical capture device.
 const DIGITAL_CAPTURE_URI: &str = "http://cv.iptc.org/newscodes/digitalsourcetype/digitalCapture";
@@ -126,12 +127,7 @@ fn mark_manifest_json() -> String {
 fn sign_mark(mark_png: &[u8], thumbnail_jpeg: &[u8], signer: &dyn Signer) -> C2paResult<Vec<u8>> {
     let mut builder = Builder::default().with_definition(mark_manifest_json())?;
     builder.add_resource(MARK_THUMBNAIL_ID, Cursor::new(thumbnail_jpeg))?;
-
-    let mut source = Cursor::new(mark_png);
-    let mut dest = Cursor::new(Vec::new());
-    builder.sign(signer, "image/png", &mut source, &mut dest)?;
-
-    Ok(dest.into_inner())
+    sign("mark", &mut builder, "image/png", mark_png, signer)
 }
 
 /// Signs a capture (a JPEG) as-is, as a `digitalCapture`, and returns the
@@ -144,12 +140,7 @@ fn sign_mark(mark_png: &[u8], thumbnail_jpeg: &[u8], signer: &dyn Signer) -> C2p
 /// synchronous and because `KmsSigner::sign` itself blocks on a KMS call.
 pub fn sign_capture(image_data: &[u8], signer: &dyn Signer) -> C2paResult<Vec<u8>> {
     let mut builder = Builder::default().with_definition(capture_manifest_json())?;
-
-    let mut source = Cursor::new(image_data);
-    let mut dest = Cursor::new(Vec::new());
-    builder.sign(signer, "image/jpeg", &mut source, &mut dest)?;
-
-    Ok(dest.into_inner())
+    sign("capture", &mut builder, "image/jpeg", image_data, signer)
 }
 
 /// Step two of the capture pipeline (`/watermark`): takes a capture
@@ -160,9 +151,10 @@ pub fn sign_capture(image_data: &[u8], signer: &dyn Signer) -> C2paResult<Vec<u8
 /// `sign-photo` got back from step one, but the chain is only worth anything
 /// if its first link is always there. Blocking, like `sign_capture`.
 pub fn sign_watermarked(signed_capture: &[u8], signer: &dyn Signer) -> anyhow::Result<Vec<u8>> {
-    Reader::default()
-        .with_stream("image/jpeg", Cursor::new(signed_capture))
-        .map_err(|e| anyhow::anyhow!("input is not a signed capture: {e}"))?;
+    timing::time("check_input", || {
+        Reader::default().with_stream("image/jpeg", Cursor::new(signed_capture))
+    })
+    .map_err(|e| anyhow::anyhow!("input is not a signed capture: {e}"))?;
     watermark_signed_capture(signed_capture, signer)
 }
 
@@ -182,6 +174,7 @@ pub fn watermark_signed_capture(signed_capture: &[u8], signer: &dyn Signer) -> a
         watermark::watermark(capture)?;
 
     let mut builder = Builder::default().with_definition(watermarked_manifest_json())?;
+    let start = Instant::now();
     builder.add_ingredient_from_stream(
         format!(
             r#"{{ "title": "the-human-internet-capture.jpg", "relationship": "parentOf", "label": "{CAPTURE_INGREDIENT_LABEL}" }}"#
@@ -189,9 +182,11 @@ pub fn watermark_signed_capture(signed_capture: &[u8], signer: &dyn Signer) -> a
         "image/jpeg",
         &mut Cursor::new(signed_capture),
     )?;
+    tracing::info!(step = "add_ingredient", ingredient = CAPTURE_INGREDIENT_LABEL, ms = timing::ms_since(start), "timing");
     // Its own credentials carry its thumbnail; the ingredient just points
     // at that, as the capture's does.
     let signed_mark = sign_mark(&mark_png, &mark_thumbnail_jpeg, signer)?;
+    let start = Instant::now();
     builder.add_ingredient_from_stream(
         format!(
             r#"{{ "title": "the-human-internet-brand-mark.png", "relationship": "componentOf", "label": "{BRAND_MARK_INGREDIENT_LABEL}" }}"#
@@ -199,11 +194,25 @@ pub fn watermark_signed_capture(signed_capture: &[u8], signer: &dyn Signer) -> a
         "image/png",
         &mut Cursor::new(signed_mark),
     )?;
+    tracing::info!(step = "add_ingredient", ingredient = BRAND_MARK_INGREDIENT_LABEL, ms = timing::ms_since(start), "timing");
 
-    let mut source = Cursor::new(watermarked);
+    Ok(sign("photo", &mut builder, "image/jpeg", &watermarked, signer)?)
+}
+
+/// `Builder::sign`, timed as `manifest`'s signing. Until claim thumbnails
+/// are supplied, this includes c2pa decoding `asset` to make one.
+fn sign(
+    manifest: &'static str,
+    builder: &mut Builder,
+    format: &str,
+    asset: &[u8],
+    signer: &dyn Signer,
+) -> C2paResult<Vec<u8>> {
+    let start = Instant::now();
+    let mut source = Cursor::new(asset);
     let mut dest = Cursor::new(Vec::new());
-    builder.sign(signer, "image/jpeg", &mut source, &mut dest)?;
-
+    builder.sign(signer, format, &mut source, &mut dest)?;
+    tracing::info!(step = "sign", manifest, ms = timing::ms_since(start), "timing");
     Ok(dest.into_inner())
 }
 

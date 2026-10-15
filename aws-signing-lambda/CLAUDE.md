@@ -116,6 +116,22 @@ non-technical process — see the app repo's `CLAUDE.md` Known Gap #1).
   `brand_mark_watermark`**; to change the artwork, replace it in all three
   repos (transparent background, ≥ ~600px wide) and update the dimension
   check in each repo's tests (1024×1082 today).
+- `src/timing.rs` — **where an invocation's time goes**, as one `timing` log
+  event per step with `ms`: `download`, `decode`, `draw_mark`, `encode`
+  (with the `quality` it ended at and how many `attempts` `encode_within`
+  needed), `check_input` (`/watermark`'s `Reader`), `add_ingredient`,
+  `sign` (`manifest`: `capture`, `mark`, `photo` — each includes its KMS
+  round trip), `upload` (`output`), and `total` (`path`, `status`). c2pa
+  makes its thumbnails inside `sign` and `add_ingredient`, so their decoding
+  is counted there. Events from the signing thread carry the invocation's
+  `requestId` like the rest. In CloudWatch Logs Insights:
+
+  ```text
+  filter fields.message = "timing"
+  | stats avg(fields.ms), pct(fields.ms, 90), count() by fields.step, fields.manifest
+  ```
+
+  and `filter span.requestId = "<id>"` for one invocation, step by step.
 - **Tests** (`cargo test --release`): the watermark's placement, colour
   rule and orientation handling, and both manifests read back through `c2pa::Reader`
   — `Valid`, with `signingCredential.untrusted` the only failure, the

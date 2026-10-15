@@ -37,6 +37,9 @@ use image::{
 };
 use std::io::Cursor;
 use std::sync::OnceLock;
+use std::time::Instant;
+
+use crate::timing;
 
 /// Mark width as a fraction of the image's shorter side.
 pub const MARK_SIZE_FRACTION: f32 = 0.09;
@@ -103,6 +106,7 @@ pub struct DecodedCapture {
 /// UIKit's redraw did on device. The ICC profile is kept; other metadata
 /// (EXIF, GPS) is dropped, as it was on device.
 pub fn decode_capture(jpeg: &[u8]) -> Result<DecodedCapture> {
+    let start = Instant::now();
     let mut decoder = ImageReader::new(Cursor::new(jpeg))
         .with_guessed_format()?
         .into_decoder()
@@ -111,7 +115,15 @@ pub fn decode_capture(jpeg: &[u8]) -> Result<DecodedCapture> {
     let icc_profile = decoder.icc_profile()?;
     let mut image = DynamicImage::from_decoder(decoder)?;
     image.apply_orientation(orientation);
-    Ok(DecodedCapture { rgb: image.into_rgb8(), icc_profile })
+    let rgb = image.into_rgb8();
+    tracing::info!(
+        step = "decode",
+        width = rgb.width(),
+        height = rgb.height(),
+        ms = timing::ms_since(start),
+        "timing"
+    );
+    Ok(DecodedCapture { rgb, icc_profile })
 }
 
 /// Burns the brand mark into `capture` and re-encodes it as a JPEG, carrying
@@ -125,7 +137,7 @@ pub fn watermark(capture: DecodedCapture) -> Result<Watermarked> {
     let is_display_p3 = icc_profile
         .as_deref()
         .is_some_and(|icc| contains(icc, b"Display P3") || contains(icc, &utf16be("Display P3")));
-    let (mark_png, color) = draw_mark(&mut rgb, is_display_p3)?;
+    let (mark_png, color) = timing::time("draw_mark", || draw_mark(&mut rgb, is_display_p3))?;
 
     Ok(Watermarked {
         jpeg: encode_within(&rgb, icc_profile.as_deref(), MAX_WATERMARKED_JPEG_BYTES)?,
@@ -157,13 +169,24 @@ fn mark_thumbnail(color: MarkColor) -> Result<Vec<u8>> {
 /// than failing to upload. Returns the last attempt if even the lowest
 /// quality is over — still better than a guaranteed 413.
 fn encode_within(rgb: &RgbImage, icc_profile: Option<&[u8]>, max_bytes: usize) -> Result<Vec<u8>> {
+    let start = Instant::now();
     let mut out = Vec::new();
+    let (mut attempts, mut used) = (0, JPEG_QUALITY);
     for quality in std::iter::once(JPEG_QUALITY).chain(FALLBACK_JPEG_QUALITIES) {
         out = encode(rgb, icc_profile, quality)?;
+        (attempts, used) = (attempts + 1, quality);
         if out.len() <= max_bytes {
             break;
         }
     }
+    tracing::info!(
+        step = "encode",
+        quality = used,
+        attempts,
+        bytes = out.len(),
+        ms = timing::ms_since(start),
+        "timing"
+    );
     Ok(out)
 }
 

@@ -1,12 +1,14 @@
 mod handoff;
 mod kms_signer;
 mod manifest;
+mod timing;
 mod watermark;
 
 use aws_sdk_kms::Client as KmsClient;
 use aws_sdk_ssm::Client as SsmClient;
 use kms_signer::KmsSigner;
 use lambda_http::{run, service_fn, Body, Error, Request, Response};
+use std::time::Instant;
 
 /// SSM parameter holding the public (not secret) leaf+CA cert chain — see
 /// the checklist's cert-issuance step. Read once at cold start rather than
@@ -68,7 +70,18 @@ async fn main() -> Result<(), Error> {
     .await
 }
 
+/// [`dispatch`], with its total duration logged — see `timing.rs` for the rest
+/// of the breakdown.
 async fn handle(req: Request, key: SigningKey) -> Result<Response<Body>, Error> {
+    let start = Instant::now();
+    let path = req.uri().path().to_owned();
+    let response = dispatch(req, key).await;
+    let status = response.as_ref().map_or(500, |r| r.status().as_u16());
+    tracing::info!(step = "total", path, status, ms = timing::ms_since(start), "timing");
+    response
+}
+
+async fn dispatch(req: Request, key: SigningKey) -> Result<Response<Body>, Error> {
     let body = match req.body() {
         Body::Binary(bytes) => bytes.clone(),
         Body::Text(text) => text.clone().into_bytes(),
@@ -122,7 +135,7 @@ async fn handle(req: Request, key: SigningKey) -> Result<Response<Body>, Error> 
     let client = handoff::client()?;
     let image_data = handoff::fetch_source(&client, &request.source_url).await?;
     let signed = sign(route, image_data, &key).await?;
-    let stored = handoff::store_result(&client, &request.dest_url, signed).await?;
+    let stored = handoff::store_result(&client, &request.dest_url, signed, route.name()).await?;
     handoff_answer(route, &stored)
 }
 
@@ -141,10 +154,10 @@ async fn pipeline(body: &[u8], key: SigningKey) -> Result<Response<Body>, Error>
     let original = key.run(move |signer| Ok(manifest::sign_capture(&raw_capture, signer)?)).await?;
     let watermarking = original.clone();
     let (original, photo) = tokio::try_join!(
-        handoff::store_result(&client, &request.original_url, original),
+        handoff::store_result(&client, &request.original_url, original, "original"),
         key.run(move |signer| manifest::watermark_signed_capture(&watermarking, signer)),
     )?;
-    let photo = handoff::store_result(&client, &request.photo_url, photo).await?;
+    let photo = handoff::store_result(&client, &request.photo_url, photo, "photo").await?;
 
     handoff_answer(Route::Pipeline, &handoff::PipelineResponse { original, photo })
 }
@@ -190,12 +203,15 @@ impl SigningKey {
     /// Runs `sign` with a signer for this key, on Tokio's blocking thread
     /// pool: c2pa-rs's Builder is synchronous, and `KmsSigner` blocks its own
     /// thread waiting on KMS — both wrong to run directly on an async task.
+    /// Inside the invocation's span, so what it logs carries the request id.
     async fn run<T: Send + 'static>(
         &self,
         sign: impl FnOnce(&KmsSigner) -> anyhow::Result<T> + Send + 'static,
     ) -> anyhow::Result<T> {
         let key = self.clone();
+        let span = tracing::Span::current();
         tokio::task::spawn_blocking(move || {
+            let _invocation = span.enter();
             let signer = KmsSigner::new(key.kms_client, key.key_id, &key.cert_chain_pem)?;
             sign(&signer)
         })
