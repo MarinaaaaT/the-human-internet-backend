@@ -16,9 +16,9 @@
 // (`X-App-Attest-Key-Id` + `X-App-Attest-Assertion`, base64), made by a key
 // `app-attest-register` verified came from our app on real Apple hardware:
 //   - assertion present ⇒ it must verify, or nothing is signed;
-//   - assertion absent  ⇒ refused if the `require_app_attest` flag resolves
-//     on for this caller, otherwise signed and logged. The flag starts `off`
-//     because every build already in the wild sends no assertion.
+//   - assertion absent  ⇒ refused. This was the `require_app_attest` flag
+//     until 2026-10-25, rolled out to `all` and then removed; the row is
+//     left in `feature_flags` but nothing reads it.
 // Errors carry a `code` the app acts on: `attestation_key_unknown` and
 // `attestation_invalid` make it discard its key and register a fresh one.
 //
@@ -26,9 +26,9 @@
 // a request may carry `X-Play-Integrity-Token`, a Google Play Integrity token
 // the app requested over SHA-256 of the exact body. It counts as attested
 // when Google decodes it to a Play-installed build of our app on a genuine
-// device (`_shared/playIntegrity.ts`). The one flag governs both platforms —
-// see `checkPlayIntegrity` for how its failure handling differs from App
-// Attest's, and why.
+// device (`_shared/playIntegrity.ts`). Required just the same: an Android
+// request with neither a token nor an assertion is refused, and so is one
+// whose token doesn't pass.
 //
 // **Capture pipeline** (`X-Capture-Pipeline: server-watermark-v1` +
 // `X-Photo-Id`): the body is the *raw* capture. One Lambda call (`/pipeline`)
@@ -75,12 +75,6 @@ const LAMBDA_FUNCTION_URL = Deno.env.get("SIGNING_LAMBDA_URL")!;
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 const AWS_REGION = Deno.env.get("AWS_REGION")!;
-
-/// Mirrors FeatureFlagAudience.includes(isAdmin:). A missing row or an
-/// audience this function doesn't recognise reads as off — the rollout
-/// default, since failing closed on a flag we couldn't read would stop every
-/// upload from every build that predates attestation.
-const REQUIRE_APP_ATTEST_FLAG = "require_app_attest";
 
 /// Carries the Android app's Play Integrity token. Mirrored in the Android
 /// app's `PlayIntegrityService`.
@@ -152,7 +146,7 @@ Deno.serve(async (req) => {
       });
     }
 
-    const refusal = await checkAppAttest(req, imageData, user.id, supabaseClient);
+    const refusal = await checkAppAttest(req, imageData, user.id);
     if (refusal) return refusal;
 
     const photoID = req.headers.get("X-Photo-Id")?.toLowerCase();
@@ -542,8 +536,6 @@ async function checkAppAttest(
   req: Request,
   imageData: Uint8Array,
   userId: string,
-  // deno-lint-ignore no-explicit-any
-  supabaseClient: any,
 ): Promise<Response | null> {
   const keyId = req.headers.get("X-App-Attest-Key-Id");
   const assertion = req.headers.get("X-App-Attest-Assertion");
@@ -551,13 +543,10 @@ async function checkAppAttest(
   if (!keyId || !assertion) {
     const integrityToken = req.headers.get(PLAY_INTEGRITY_HEADER);
     if (integrityToken) {
-      return await checkPlayIntegrity(integrityToken, imageData, userId, supabaseClient);
+      return await checkPlayIntegrity(integrityToken, imageData, userId);
     }
-    if (await isAppAttestRequired(userId, supabaseClient)) {
-      return refuse(403, "attestation_required");
-    }
-    console.warn("Signing without App Attest", { user: userId });
-    return null;
+    console.warn("Refused a request without attestation", { user: userId });
+    return refuse(403, "attestation_required");
   }
 
   const { data: key, error: keyError } = await supabaseAdmin
@@ -600,22 +589,14 @@ async function checkAppAttest(
 /// The Android half of `checkAppAttest`: returns a response to send instead
 /// of signing, or null to go ahead.
 ///
-/// Where it differs from App Attest, and why: a failed App Attest assertion
-/// is refused even while the flag is off, because every build that sends one
-/// can produce a valid one. That isn't true here — a debug build, or any
-/// build on the emulator, gets a real token that Google marks unrecognized.
-/// So the flag alone decides:
-///   - attestation not required for this caller ⇒ any failure is logged and
-///     the photo is signed, exactly as if no token had been sent;
-///   - required ⇒ the token must pass in full. There is no exemption for
-///     admins or for development builds: with the flag on, Android signs
-///     only from a Play-installed build on a genuine device.
+/// The token must pass in full. There is no exemption for admins or for
+/// development builds: a debug build, or any build on the emulator, gets a
+/// real token that Google marks unrecognized, so Android signs only from a
+/// Play-installed build on a genuine device.
 async function checkPlayIntegrity(
   token: string,
   imageData: Uint8Array,
   userId: string,
-  // deno-lint-ignore no-explicit-any
-  supabaseClient: any,
 ): Promise<Response | null> {
   try {
     const serviceAccount = loadServiceAccount();
@@ -625,10 +606,6 @@ async function checkPlayIntegrity(
     evaluateVerdict(payload, { expectedRequestHash: await expectedRequestHash(imageData) });
     return null;
   } catch (error) {
-    if (!(await isAppAttestRequired(userId, supabaseClient))) {
-      console.warn("Signing despite a failed Play Integrity check", { user: userId, reason: String(error) });
-      return null;
-    }
     if (error instanceof PlayIntegrityError) {
       console.warn("Rejected Play Integrity token", { user: userId, reason: error.message });
       return refuse(403, "attestation_invalid");
@@ -636,36 +613,6 @@ async function checkPlayIntegrity(
     // Couldn't reach Google: an outage, not a verdict. 500, and the app retries.
     throw error;
   }
-}
-
-async function isAppAttestRequired(
-  userId: string,
-  // deno-lint-ignore no-explicit-any
-  supabaseClient: any,
-): Promise<boolean> {
-  const { data: flag, error: flagError } = await supabaseClient
-    .from("feature_flags")
-    .select("audience")
-    .eq("key", REQUIRE_APP_ATTEST_FLAG)
-    .maybeSingle();
-  if (flagError) throw flagError;
-
-  if (flag?.audience === "all") return true;
-  if (flag?.audience !== "admin") return false;
-  return await isAdmin(userId, supabaseClient);
-}
-
-// deno-lint-ignore no-explicit-any
-async function isAdmin(userId: string, supabaseClient: any): Promise<boolean> {
-  // Self-scoped RLS: this is the caller's own row, and the is_admin triggers
-  // stop them writing it.
-  const { data: profile, error: profileError } = await supabaseClient
-    .from("users")
-    .select("is_admin")
-    .eq("id", userId)
-    .single();
-  if (profileError) throw profileError;
-  return profile?.is_admin === true;
 }
 
 function refuse(status: number, code: string): Response {
