@@ -191,7 +191,7 @@ what was built and the previous digest is a one-line rollback
 `/capture` → `/watermark` as below and check both the manifest and the
 mark. `/pipeline` can only be exercised through `sign-photo` (see Testing
 below): once the `sign-photo` that calls it is deployed too, take one photo
-through the app with `server_side_watermark` on — `sign-photo` should log
+through the app (every iOS upload takes the pipeline) — `sign-photo` should log
 "Kept the signed capture" and never "has no /pipeline route yet" — and
 check the photo's manifest, its mark, and its object in `photo-originals`.
 Deploy history: 2026-09-25 `sha256:d572c32…` (server-side
