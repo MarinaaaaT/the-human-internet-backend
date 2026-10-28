@@ -23,6 +23,8 @@ supabase/
     app-attest-register/   <- App Attest key registration, step 2
     stripe-identity-session/
     stripe-identity-webhook/
+    delete-account/
+    demo-session/          <- the shared demo account: reset + session, public
 ```
 
 ## AWS signing Lambda
@@ -31,7 +33,7 @@ Full architecture, build/deploy instructions, gotchas, and the AWS resource inve
 
 ## Supabase Edge Functions
 
-Deployed as a unit via the Supabase CLI (`supabase functions deploy`); `supabase/config.toml` covers all six.
+Deployed as a unit via the Supabase CLI (`supabase functions deploy`); `supabase/config.toml` covers all eight.
 
 ### `sign-photo`
 Forwards a captured JPEG to the AWS Lambda's Function URL over SigV4 and returns the signed bytes — the only bridge between Supabase and AWS, and the app's only signer (`Verification/RemotePhotoSigner.swift`; the on-device fallback and the `aws_server_side_signing` flag that chose between them were removed from the app on 2026-09-23). Runs with the caller's forwarded JWT (`verify_jwt = true`), so it only ever signs on behalf of the authenticated user calling it. Requires secrets `SIGNING_LAMBDA_URL`, `AWS_REGION`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` — the AWS credentials are this function's own IAM user (`c2pa-signer-invoker`), SigV4-scoped to `lambda:InvokeFunctionUrl` on exactly this one Lambda, nothing else in the AWS account. Without those secrets the function 500s, which surfaces to users as a photo stuck in "still being verified" and then a failed-upload row in the app's pending banner (`PhotoUploadQueue` retries rather than losing it, so it recovers once the function is healthy again).
@@ -63,6 +65,8 @@ Resumable statuses (`requires_input`, `processing`, `requires_action`) reuse the
 
 **This function chooses the Stripe environment, and the client never does.** Live unless *both* the `stripe_identity_test_mode` feature flag resolves on (`audience` in `all`/`admin`) *and* the caller's `users.is_admin` is true — both re-read here through the caller's JWT, mirroring `AppState.isStripeIdentityTestModeEnabled` in the app. The app's copy of that decision only drives what its UI shows; a client that lied about it would still get a live session. The `is_admin` conjunct is what makes `all` on that flag harmless if it's ever written straight into the table (the app's developer menu refuses to set it). Requires secrets `STRIPE_SECRET_KEY` and — only if the test environment is used — `STRIPE_SECRET_KEY_TEST`; each is read lazily, so a deployment without the test key still serves live sessions normally.
 
+**The demo account never reaches Stripe.** When the caller's `users.is_demo` is true, this function writes `verification_status = 'verified'` and the verified name "Demo Account" itself, under the service role, and answers `{ demo_verified: true }` instead of `{ url }` (app: `UserProfileRepository.IdentityVerificationStart.demoApproved`). `identity_verified_at` stays null on purpose — both pages state that date as "Identity Last Verified by Stripe", which would be false. `is_demo` is trigger-guarded like `is_admin`, which is the only thing keeping this from being a free `verified`. See `demo-session`.
+
 ### `stripe-identity-webhook`
 Public endpoint (`verify_jwt = false` — Stripe is the caller, not an app user). Verifies the `Stripe-Signature` header, then on `identity.verification_session.verified` / `.requires_input` flips `public.users.verification_status` to `verified`/`failed` using the Supabase **service-role** key. This is the one place in the whole project (besides Postgres security-definer functions) where a privileged write happens outside RLS — treat any change here with the same care as a migration. Requires secrets `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`, `SUPABASE_SERVICE_ROLE_KEY`, plus `STRIPE_WEBHOOK_SECRET_TEST` if the test environment is in use.
 
@@ -75,6 +79,11 @@ Still missing (tracked on Notion's Tech Debt board as **[T2]**): no `event.id` d
 ### `delete-account`
 Permanently deletes the **calling** user's account — the app's Settings → Account Settings → Delete Account. `verify_jwt = true`; the caller is identified from their own JWT, and the body carries only an Apple authorization code, never a user id, so there's no way to name another user. **First it revokes Sign in with Apple** (`appleRevocation.ts`, App Store guideline 5.1.1(v)): Supabase never kept an Apple token (`signInWithIdToken` uses the ID token alone), so the app has the user re-confirm with Apple and sends the fresh `apple_authorization_code`; this exchanges it at Apple's `/auth/token` for a refresh token and revokes that at `/auth/revoke`. Required for any account with an Apple identity (all of them). The exchanged ID token's `sub` must match the account's Apple identity, else `apple_account_mismatch` — revoking a *different* Apple ID would report success while leaving this one linked. Client ID is the app's **bundle ID** (`com.thehumaninternet.app`), since native sign-in issues codes to it. If revocation fails nothing has been deleted. Then, under the service role: `photos` rows first (what `get_verification_photo()` reads, so every shared link dies immediately — same order as the app's `PhotoRepository.delete`), then every object under `{user_id}/` in `photos` and `photo-originals`, then `auth.admin.deleteUser`, which cascades to `public.users`. Identity goes **last** so any failure leaves an account the user can sign back into and retry; each step is idempotent. Requires `APPLE_SIGNIN_KEY_ID` + `APPLE_SIGNIN_PRIVATE_KEY` (a Sign in with Apple key's ID and `.p8` contents, signing a 5-minute ES256 client secret; missing ⇒ `apple_not_configured`, 500, nothing deleted) and `SUPABASE_SERVICE_ROLE_KEY` (auto-provided).
 
+### `demo-session`
+Signs the caller into the **one shared demo account**, resetting it first — the app's `thehumaninternet://demo` link (app: `Auth/DemoAccount.swift`, `AppState.enterDemoAccount()`). `verify_jwt = false`: whoever opens the link has no session yet. Service role throughout. On first use it creates an email identity, `demo@the-human-internet.com`, with no password; every call then upserts its whole `users` row back to a new account's values with `is_demo = true` and `onboarding_step = profile` (username `demo account`, or empty if a real user has since taken that), leaving `photos` rows and Storage untouched, and returns `{ access_token, refresh_token }`, minted by `auth.admin.generateLink({ type: "magiclink" })` and redeeming its `hashed_token` with `verifyOtp` on an anon client — nothing is emailed, and there's no password to keep. Deploy order: `supabase/sql/2026-10-28_demo_account.sql` first (it adds `is_demo`, its triggers, and `is_demo` on both verification RPCs), then this function and `stripe-identity-session`, then the app.
+
+Known tradeoffs: the endpoint is public, so anyone can reset the demo account, and everyone demoing at once shares it. Both are what "a demo account behind a link" means; neither reaches a real account.
+
 ## Database
 
 Schema, RLS policies, and triggers live in the shared Supabase project itself (`xpjkgngifffzdaikjakw`) — **not tracked as migration files in any repo**; changes are applied directly (dashboard or the Supabase MCP tools) and documented in the app repo's `CLAUDE.md` Database section, which remains the source of truth for table shapes, RLS, and the `is_admin` escalation guards. If that ever changes to a tracked-migrations workflow, this repo is the natural home for `supabase/migrations/`.
@@ -82,6 +91,8 @@ Schema, RLS policies, and triggers live in the shared Supabase project itself (`
 **`photo-originals` bucket + `photos.original_storage_path`** (`supabase/sql/2026-09-25_server_watermark.sql`): each signed capture — the ingredient of the shared photo — kept for a future photo history. Private; written only by `sign-photo` (no INSERT/UPDATE policy exists, so no client can plant an "original"); its owner can SELECT and DELETE; nobody else, anon included, can read it.
 
 **`users.watermark_enabled`** (`supabase/sql/2026-10-09_account_settings.sql`): the app's **Photo Fingerprint** switch, `not null default true`. Off ⇒ the app signs the raw capture as-is with no visible mark. Read and written by the app as a one-column query, never in the whole-row `HumanUser` upsert, so older builds are unaffected. Claims nothing — the manifest is the proof either way.
+
+**`users.is_demo`** (`supabase/sql/2026-10-28_demo_account.sql`): marks the shared demo account. Written only by `demo-session` under the service role; `prevent_self_demo_change` (BEFORE UPDATE) and `force_is_demo_false_on_insert` (BEFORE INSERT) revert any other write, with the same `service_role`/NULL-role exemptions as `is_admin`. Must stay guarded: `stripe-identity-session` auto-verifies an `is_demo` caller. Both `get_verification_photo()` and `get_photo_owner_profile()` return it, ungated, so both pages can print the demo disclaimer.
 
 **App Attest tables** (`supabase/sql/2026-09-25_app_attest.sql`, the record of what to apply): `app_attest_keys` (key id → attested public key, environment, highest counter seen) and `app_attest_challenges` (single-use registration challenges). Both have RLS **on with no policies** — reachable only by the Edge Functions' service role, never through PostgREST.
 
