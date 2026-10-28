@@ -15,3 +15,8 @@ verify_jwt = true
 
 [functions.delete-account]
 verify_jwt = true
+
+# Public: the demo link is opened by someone with no session yet. See the
+# function's header for why that's safe.
+[functions.demo-session]
+verify_jwt = false

@@ -16,6 +16,12 @@
 // the flag and the is_admin check are both re-read here. A sandbox
 // verification proves nothing about a real person, so "which environment" is
 // exactly the kind of decision that can't be delegated to a client.
+//
+// The demo account (`users.is_demo`, see demo-session) never reaches Stripe:
+// it is approved on the spot, under the service role, and answered with
+// `{ demo_verified: true }` instead of a URL. `is_demo` is trigger-guarded
+// like `is_admin`, which is what keeps this from being a free `verified`
+// for anyone who could flip it.
 
 import { createClient } from "npm:@supabase/supabase-js@2";
 import Stripe from "npm:stripe@18";
@@ -42,6 +48,12 @@ const TEST_MODE_AUDIENCES = new Set(["all", "admin"]);
 // Statuses worth reusing (retrieving refreshes the short-lived `url`) rather
 // than creating a brand new session, per Stripe's VerificationSession best
 // practices.
+/// What a demo verification stores as the verified name. `identity_verified_at`
+/// stays null on purpose: both pages state a date as "Identity Last Verified
+/// by Stripe on …", and Stripe never saw this one. Without it they fall back
+/// to the bare name.
+const DEMO_VERIFIED_NAME = { first: "Demo", last: "Account" };
+
 const RESUMABLE_STATUSES = new Set(["requires_input", "processing", "requires_action"]);
 
 type StripeMode = "live" | "test";
@@ -56,6 +68,33 @@ function stripeFor(mode: StripeMode): Stripe {
     throw new Error(`Missing ${name} — Stripe's ${mode} environment isn't configured`);
   }
   return new Stripe(secret, { httpClient: Stripe.createFetchHttpClient() });
+}
+
+/// The demo account's whole verification: `verified`, with a placeholder name,
+/// written by the service role — the only role the triggers on public.users
+/// let set either. demo-session resets both on the next demo link.
+async function approveDemo(userID: string): Promise<Response> {
+  const supabaseAdmin = createClient(
+    Deno.env.get("SUPABASE_URL")!,
+    Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!,
+    { auth: { persistSession: false, autoRefreshToken: false } },
+  );
+  const { error } = await supabaseAdmin
+    .from("users")
+    .update({
+      verification_status: "verified",
+      verified_first_name: DEMO_VERIFIED_NAME.first,
+      verified_last_name: DEMO_VERIFIED_NAME.last,
+      identity_verified_at: null,
+      stripe_identity_session_id: null,
+    })
+    .eq("id", userID)
+    .eq("is_demo", true);
+  if (error) throw error;
+  console.log(`Demo account ${userID} verified without Stripe`);
+  return new Response(JSON.stringify({ demo_verified: true }), {
+    headers: { "Content-Type": "application/json" },
+  });
 }
 
 Deno.serve(async (req) => {
@@ -82,10 +121,14 @@ Deno.serve(async (req) => {
     // public.users revert any client-side change to it.
     const { data: profile, error: profileError } = await supabaseClient
       .from("users")
-      .select("stripe_identity_session_id, is_admin")
+      .select("stripe_identity_session_id, is_admin, is_demo")
       .eq("id", user.id)
       .single();
     if (profileError) throw profileError;
+
+    if (profile?.is_demo) {
+      return await approveDemo(user.id);
+    }
 
     const { data: flag, error: flagError } = await supabaseClient
       .from("feature_flags")
