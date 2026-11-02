@@ -34,7 +34,9 @@
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+use crate::timing;
 
 /// Request header that selects this transport, echoed on the response.
 /// Mirrored in `supabase/functions/sign-photo/index.ts`.
@@ -144,6 +146,7 @@ pub fn client() -> Result<reqwest::Client> {
 
 /// Downloads the input object.
 pub async fn fetch_source(client: &reqwest::Client, url: &str) -> Result<Vec<u8>> {
+    let start = Instant::now();
     let response = client
         .get(url)
         .send()
@@ -165,12 +168,19 @@ pub async fn fetch_source(client: &reqwest::Client, url: &str) -> Result<Vec<u8>
     if bytes.len() as u64 > MAX_SOURCE_BYTES {
         bail!("source is larger than {MAX_SOURCE_BYTES} bytes");
     }
+    tracing::info!(step = "download", bytes = bytes.len(), ms = timing::ms_since(start), "timing");
     Ok(bytes.to_vec())
 }
 
 /// Uploads the signed result to the output object, and describes it for the
-/// response.
-pub async fn store_result(client: &reqwest::Client, url: &str, signed: Vec<u8>) -> Result<HandoffResponse> {
+/// response. `output` names it in the timing log.
+pub async fn store_result(
+    client: &reqwest::Client,
+    url: &str,
+    signed: Vec<u8>,
+    output: &'static str,
+) -> Result<HandoffResponse> {
+    let start = Instant::now();
     let described = describe(&signed);
     let response = client
         .put(url)
@@ -185,6 +195,7 @@ pub async fn store_result(client: &reqwest::Client, url: &str, signed: Vec<u8>) 
         let detail = response.text().await.unwrap_or_default();
         bail!("result upload returned {status}: {detail}");
     }
+    tracing::info!(step = "upload", output, bytes = described.bytes, ms = timing::ms_since(start), "timing");
     Ok(described)
 }
 
