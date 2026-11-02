@@ -94,6 +94,8 @@ Schema, RLS policies, and triggers live in the shared Supabase project itself (`
 
 **`users.is_demo`** (`supabase/sql/2026-10-28_demo_account.sql`): marks the shared demo account. Written only by `demo-session` under the service role; `prevent_self_demo_change` (BEFORE UPDATE) and `force_is_demo_false_on_insert` (BEFORE INSERT) revert any other write, with the same `service_role`/NULL-role exemptions as `is_admin`. Must stay guarded: `stripe-identity-session` auto-verifies an `is_demo` caller. Both `get_verification_photo()` and `get_photo_owner_profile()` return it, ungated, so both pages can print the demo disclaimer.
 
+**`photo_reports`** (`supabase/sql/2026-11-01_photo_reports.sql`): the app's **Report photo** on the in-app verification page (App Review guideline 1.2). `photo_id` (cascades on photo delete), `reporter_id` (defaults to `auth.uid()`), `reason` (CHECK-constrained, mirrored by the app's `PhotoReportReason`), `created_at`, unique per `(photo_id, reporter_id)`. **Insert-only through PostgREST**: one INSERT policy — as yourself, about a photo whose `user_id` isn't you — and no SELECT/UPDATE/DELETE policy, so nobody, reporter included, reads reports back; `anon` has no grant at all. Reviewed by hand under a privileged role. Must be applied before the app build that writes it ships, or every report fails with "Couldn't send your report".
+
 **App Attest tables** (`supabase/sql/2026-09-25_app_attest.sql`, the record of what to apply): `app_attest_keys` (key id → attested public key, environment, highest counter seen) and `app_attest_challenges` (single-use registration challenges). Both have RLS **on with no policies** — reachable only by the Edge Functions' service role, never through PostgREST.
 
 ## Secrets
